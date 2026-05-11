@@ -1,0 +1,3033 @@
+-- ============
+-- PHANTOM HUB 
+-- ============
+local clamp = math.clamp or function(v, lo, hi) return v < lo and lo or v > hi and hi or v end
+local task = task or {
+    spawn=function(f,...) local co=coroutine.wrap(f); co(...); return co end,
+    wait=function(t) return wait(t or 0) end,
+    delay=function(t,f,...) delay(t,f,...) end,
+    cancel=function() end,
+    defer=function(f,...) local co=coroutine.wrap(f); co(...); return co end,
+}
+local tbl_clear = table.clear or function(t) for k in next,t do t[k]=nil end end
+
+local HAS_DRAWING=false
+do
+    local _dt=typeof(Drawing)
+    if _dt=="table" or _dt=="userdata" then
+        local ok,test=pcall(function() local d=Drawing.new("Line"); d:Remove(); return true end)
+        HAS_DRAWING=ok and (test==true)
+    end
+    if not HAS_DRAWING then warn("PHANTOM: Drawing API indisponível") end
+end
+
+local HAS_FILESYSTEM=false
+do
+    local ok=pcall(function()
+        if writefile and readfile and isfile then
+            local t=".phantom_fs_test"; writefile(t,"1")
+            if isfile(t) then delfile(t) end; HAS_FILESYSTEM=true
+        end
+    end)
+    if not ok then HAS_FILESYSTEM=false end
+end
+
+local HAS_MOUSE1CLICK=typeof(mouse1click)=="function"
+local _genv=nil; pcall(function() _genv=getgenv() end)
+local _configGenvKey="_sys"..tostring(game:GetService("Players").LocalPlayer.UserId%7919).."_cfg"
+local _camOkThisFrame=false
+
+local Players=game:GetService("Players"); local RunService=game:GetService("RunService")
+local TweenService=game:GetService("TweenService"); local UserInputService=game:GetService("UserInputService")
+local HttpService=game:GetService("HttpService"); local LocalPlayer=Players.LocalPlayer
+local Camera=workspace.CurrentCamera
+
+local function isCameraModifiable() local ct=Camera.CameraType; return ct==Enum.CameraType.Custom or ct==Enum.CameraType.Follow end
+
+local cos=math.cos; local sin=math.sin; local rad=math.rad; local sqrt=math.sqrt; local floor=math.floor
+local huge=math.huge; local abs=math.abs; local max=math.max; local min=math.min
+local tan=math.tan; local exp=math.exp; local acos=math.acos; local deg=math.deg; local pi=math.pi
+local sfmt=string.format
+
+local function _clearWeakTable(tbl) for k in next,tbl do rawset(tbl,k,nil) end end
+local function _safeClear(t)
+    if type(t)~="table" then return end
+    local mt=getmetatable(t)
+    if mt and (mt.__mode=="k" or mt.__mode=="v" or mt.__mode=="kv") then warn("PHANTOM: tentativa de tbl_clear em weak table bloqueada"); return end
+    tbl_clear(t)
+end
+
+local isRunning=true; local TWO_PI=pi*2
+local diedConnections=setmetatable({},{__mode="kv"})
+local STATE_CACHE_TTL=0.05; local prevSilent=false; local FLOOR_RAY_DIR=Vector3.new(0,-5,0)
+local _frameTick=0; local _frameCount=0
+
+local _FOV_CURVES={Linear=function(t)return t end,Quad=function(t)return t*t end,Sqrt=function(t)return sqrt(t)end,Cubic=function(t)return t*t*t end}
+local _runESP; local _detectAspectName; local _onPlayerDied
+local _flickReset; local _flickStart; local _flickTick; local _flickState="idle"
+local _peekReset; local _peekStart; local _rcsClearPattern
+
+local _C_HUD_NAME=Color3.fromRGB(220,220,255); local _C_HUD_DIST=Color3.fromRGB(160,160,200)
+local _C_LOS_OK=Color3.fromRGB(60,220,80); local _C_LOS_FAIL=Color3.fromRGB(220,160,40)
+local _C_WL_ESP=Color3.fromRGB(80,140,255); local _C_TEAM_OK=Color3.fromRGB(80,220,80)
+local _C_TEAM_NONE=Color3.fromRGB(220,200,60); local _C_BLACK=Color3.fromRGB(0,0,0)
+local _C_WHITE=Color3.fromRGB(255,255,255); local _C_LOCK_ESP=Color3.fromRGB(255,220,40)
+local _C_LABEL_DIST=Color3.fromRGB(130,130,150)
+
+local VIS_CACHE_TTL_AIM=0.05; local VIS_CACHE_TTL_ESP=0.066; local LOCK_GRACE_PERIOD=0.30
+local BEHIND_MARGIN=-0.10; local MIN_TARGET_DIST2=0.5*0.5; local MAX_PREDICTION_VEL=1.5
+local HB_W=4; local HB_O=6; local _cachedSmoothSpeed=2.0+(20-7)*2.0  -- Smooth=7 default
+
+local Lib={Connections={},Drawings={},ESPPool={},CornerPool={},TracerPool={},SkeletonPool={},LabelPool={},HBPool={},HeadDotPool={},ActiveESP={},ActiveCorners={},ActiveTracers={},ActiveSkeleton={},ActiveLabels={},ActiveHB={},ActiveHeadDots={},HighlightPool={},ActiveHighlights={},AllPoolDrawings={}}
+local POOL_MAX={ESPPool=80,TracerPool=80,LabelPool=150,HBPool=80,CornerPool=520,SkeletonPool=400}
+
+local bestTarget=nil; local bestAimPart=nil; local bestTargetRoot=nil; local bestTargetState=nil
+local transparentParts={}; local _transparentSet={}; local highlightCount=0; local espFrameCount=0; local isHoldingAim=false
+
+local _visCache=setmetatable({},{__mode="k"}); local _boneCache=setmetatable({},{__mode="k"})
+local _inVehicleCache=setmetatable({},{__mode="k"}); local _charCache=setmetatable({},{__mode="k"})
+local _charToPlayer=setmetatable({},{__mode="k"}); local _charCacheConns=setmetatable({},{__mode="k"})
+local _boneCacheConns=setmetatable({},{__mode="k"})
+local _inVehicleEventConns={}; local _playerVehicleChar={}
+local _stateSlot={}; local _chamHPCache={}; local _labelPosCache={}; local _skelColorCache={}
+
+local _CRITICAL_CHAR_PARTS={HumanoidRootPart=true,Head=true,UpperTorso=true,Torso=true,LeftUpperArm=true,["Left Arm"]=true,RightUpperArm=true,["Right Arm"]=true}
+
+local _vpCache={}; local _vpCacheFrame=-1; local _vpEntryPool={}; local _vpCacheSize=0; local _vpMaxCacheSize=256
+local function _getVPEntry() local n=#_vpEntryPool; if n>0 then local e=_vpEntryPool[n]; _vpEntryPool[n]=nil; return e end; return{0,0,0,false} end
+local function _clearVPCache() for k,v in pairs(_vpCache) do _vpEntryPool[#_vpEntryPool+1]=v; _vpCache[k]=nil end; _vpCacheFrame=_frameCount; _vpCacheSize=0 end
+local function getVPPoint(part)
+    if _vpCacheFrame~=_frameCount then _clearVPCache() end
+    local cached=_vpCache[part]; if cached then return cached[1],cached[2],cached[3],cached[4] end
+    if _vpCacheSize>=_vpMaxCacheSize then _clearVPCache() end
+    local sp,on=Camera:WorldToViewportPoint(part.Position)
+    cached=_getVPEntry(); cached[1]=sp.X; cached[2]=sp.Y; cached[3]=sp.Z; cached[4]=on
+    _vpCache[part]=cached; _vpCacheSize=_vpCacheSize+1; return sp.X,sp.Y,sp.Z,on
+end
+
+-- ===== CHARACTER CACHE - VERSÃO MELHORADA COM FALLBACKS =====
+local _humanoidCache=setmetatable({},{__mode="k"})
+local function _findHumanoidRecursive(parent, maxDepth)
+    if maxDepth <= 0 then return nil end
+    for _, child in pairs(parent:GetChildren()) do
+        if child:IsA("Humanoid") then return child end
+    end
+    for _, child in pairs(parent:GetChildren()) do
+        if child:IsA("Folder") or child:IsA("Model") then
+            local found = _findHumanoidRecursive(child, maxDepth - 1)
+            if found then return found end
+        end
+    end
+    return nil
+end
+
+local function _buildCharCache(char)
+    local c=_charCache[char]
+    if not c then
+        c={}; _charCache[char]=c
+        local old=_charCacheConns[char]; if old then pcall(function() old:Disconnect() end) end
+        local ok,conn=pcall(function()
+            return char.ChildRemoved:Connect(function(child)
+                if _CRITICAL_CHAR_PARTS[child.Name] or child:IsA("Humanoid") then _charCache[char]=nil; _humanoidCache[char]=nil end
+            end)
+        end)
+        if ok and conn then _charCacheConns[char]=conn end
+    end
+    local isR15=char:FindFirstChild("UpperTorso")~=nil
+    
+    -- MÚLTIPLAS ESTRATÉGIAS de busca para Humanoid com cache
+    local cached_hum=_humanoidCache[char]
+    if not cached_hum then
+        cached_hum = char:FindFirstChild("Humanoid") or _findHumanoidRecursive(char, 2) or char:FindFirstChildWhichIsA("Humanoid")
+        _humanoidCache[char]=cached_hum
+    end
+    c.hum = cached_hum
+    
+    c.root=char:FindFirstChild("HumanoidRootPart"); c.head=char:FindFirstChild("Head")
+    if isR15 then c.torso=char:FindFirstChild("UpperTorso"); c.lShoulder=char:FindFirstChild("LeftUpperArm"); c.rShoulder=char:FindFirstChild("RightUpperArm")
+    else c.torso=char:FindFirstChild("Torso"); c.lShoulder=char:FindFirstChild("Left Arm"); c.rShoulder=char:FindFirstChild("Right Arm") end
+    return c
+end
+local function _getCharCache(char) return _charCache[char] or _buildCharCache(char) end
+
+local _wallFilter={}; local _wallFilterDirty=true; local configDirty=false
+local _playerListCache={}; local _playerSet={}; local _playerListNeedsCompact=false; local _playerListDirty=true
+
+local function _rebuildPlayerList()
+    tbl_clear(_playerListCache); tbl_clear(_playerSet)
+    local list=Players:GetPlayers(); local n=0
+    for i=1,#list do local p=list[i]; if p~=LocalPlayer then n=n+1; _playerListCache[n]=p; _playerSet[p]=n end end
+    _playerListDirty=false; _playerListNeedsCompact=false
+end
+local function _playerListAdd(p)
+    if p==LocalPlayer then return end; if _playerSet[p] then return end
+    local n=#_playerListCache+1; _playerListCache[n]=p; _playerSet[p]=n
+    if not _stateSlot[p.UserId] then _stateSlot[p.UserId]={state={speed=0,isMoving=false,isCrouched=false,isAirborne=false,velocity=Vector3.zero,inVehicle=false},rootPos=Vector3.zero,t=0,uidMod=p.UserId%3} end
+end
+local function _playerListRemove(p) local idx=_playerSet[p]; if not idx then return end; _playerSet[p]=nil; _playerListCache[idx]=false; _playerListNeedsCompact=true end
+local function _compactPlayerList()
+    if not _playerListNeedsCompact then return end
+    local n=0; local cacheLen=#_playerListCache
+    for i=1,cacheLen do
+        local p=_playerListCache[i]
+        if p and p~=false and p.Parent then
+            n=n+1
+            if n~=i then _playerListCache[n]=p; _playerSet[p]=n end
+        end
+    end
+    for i=n+1,cacheLen do _playerListCache[i]=nil end
+    _playerListNeedsCompact=false
+end
+local function getPlayerList() if _playerListDirty then _rebuildPlayerList() end; return _playerListCache end
+local _iterSnapshot={}
+local function getPlayerSnapshot()
+    if _playerListDirty then _rebuildPlayerList() end; _compactPlayerList()
+    local src=_playerListCache; local n=#src
+    for i=1,n do _iterSnapshot[i]=src[i] end
+    for i=n+1,#_iterSnapshot do _iterSnapshot[i]=nil end
+    return _iterSnapshot,n
+end
+
+local CONFIG_VERSION=3
+local Config={
+    AimbotEnabled=false,AimbotMode="Toggle",SilentAim=false,FOV=120,Smooth=7,HitboxPart="Auto",
+    TeamCheck=true,WallCheck=true,LockOnVisible=true,ShowWhitelistESP=true,MaxDistance=500,
+    PredictionEnabled=true,LagCompensation=true,FOVMinDist=30,FOVMaxDist=500,FOVSyncVisual=false,
+    FOVCurve="Sqrt",LockThreshold=20,LockMaxTime=4.0,LockMinTime=0.3,MaxAngularSpeed=720,
+    ScoreWeightFOV=100,ScoreWeightDist=25,ScoreWeightHP=15,BulletSpeed=0,
+    TriggerbotEnabled=false,TriggerIntegrated=true,TriggerDelay=12,RecoilEnabled=false,
+    ESPEnabled=false,ChamEnabled=false,ChamHPColor=true,TracerEnabled=false,TracerOrigin="Bottom",
+    SkeletonEnabled=false,LabelsEnabled=false,HealthBarEnabled=true,TeamColorESP=false,TargetHUDEnabled=true,
+    ESPColor=Color3.fromRGB(255,255,255),ESPWallColor=Color3.fromRGB(140,80,220),
+    TracerColor=Color3.fromRGB(255,100,100),ChamFillColor=Color3.fromRGB(255,0,0),
+    ChamOutlineColor=Color3.fromRGB(255,255,255),CrosshairEnabled=false,CrosshairSize=10,
+    CrosshairGap=3,CrosshairColor=Color3.fromRGB(255,255,255),CrosshairThickness=1,
+    Whitelist={},PriorityList={},AdminIDs={},
+    Keybinds={MenuOpen={ktype="key",value=Enum.KeyCode.RightShift},AimbotKey={ktype="key",value=Enum.KeyCode.V},ESPKey={ktype="key",value=Enum.KeyCode.J},ReleaseLock={ktype="key",value=Enum.KeyCode.X},FlickKey={ktype="mouse",value=Enum.UserInputType.MouseButton1},PeekKey={ktype="key",value=Enum.KeyCode.F},Panic={ktype="key",value=Enum.KeyCode.Delete}},
+    WeaponProfiles={["Sniper"]={FOV=40,Smooth=4,RecoilY=0.08,RecoilX=0.00,BulletSpeed=3000},["AK47"]={FOV=100,Smooth=10,RecoilY=0.05,RecoilX=0.02,BulletSpeed=1800},["Pistol"]={FOV=80,Smooth=8,RecoilY=0.03,RecoilX=0.00,BulletSpeed=1200}},
+    Profiles={},ActiveProfile=nil,DebugMode=false,
+    SpringSmoothing=false,SpringDamping=85,MagnetismEnabled=false,MagnetismStrength=50,HeadDotEnabled=false,
+    -- NOVAS FEATURES
+    FlickEnabled=false,FlickSpeed=12,FlickReturnSpeed=8,ShowFOV=true,
+    OffScreenEnabled=false,OffScreenSize=14,
+    WeaponLabelEnabled=false,
+    -- RCS DINÂMICO
+    DynRCSEnabled=false,DynRCSStrength=80,DynRCSMaxSamples=24,
+    -- AUTO-PEEK
+    AutoPeekEnabled=false,AutoPeekDist=6,AutoPeekSpeed=18,
+}
+-- Smooth=1 → snap (speed alto), Smooth=20 → suave (speed baixo)
+local function _updateSmoothCache() _cachedSmoothSpeed=2.0+(20-Config.Smooth)*2.0 end
+local CONFIG_NUM_LIMITS={FOV={10,180},Smooth={1,20},MaxDistance={50,2000},TriggerDelay={1,100},CrosshairSize={1,60},CrosshairGap={0,30},CrosshairThickness={1,5},FOVMinDist={0,1000},FOVMaxDist={0,2000},LockThreshold={1,180},LockMaxTime={0.1,20},LockMinTime={0.0,5},MaxAngularSpeed={1,3600},ScoreWeightFOV={0,999},ScoreWeightDist={0,999},ScoreWeightHP={0,999},BulletSpeed={0,9999},SpringDamping={1,100},MagnetismStrength={1,100},FlickSpeed={1,20},FlickReturnSpeed={1,20},OffScreenSize={8,28},DynRCSStrength={1,100},DynRCSMaxSamples={4,60},AutoPeekDist={2,12},AutoPeekSpeed={1,30}}
+
+-- ================================================================
+-- 2. NOTIFICAÇÕES
+-- ================================================================
+local NOTIF_INTERVAL=0.35; local NOTIF_MAX_QUEUE=10; local NOTIF_MAX_SCREEN=5; local NOTIF_DEBOUNCE_MAX_ENTRIES=500
+local notifQueue={}; local notifHead=1; local notifTail=0; local activeNotifCount=0; local notifOrderCount=0
+local NotifContainer=nil; local _notifDebounce={}; local NOTIF_DEBOUNCE_T=0.4
+local _notifDebouncePurgeT=0; local _notifDebounceEntryCount=0
+local NOTIF_COLORS={info=Color3.fromRGB(80,120,220),warn=Color3.fromRGB(220,180,40),error=Color3.fromRGB(220,60,60),success=Color3.fromRGB(60,200,100)}
+
+local function notify(msg,nType,duration)
+    if not isRunning then return end; msg=tostring(msg or "")
+    if (notifTail-notifHead+1)>=NOTIF_MAX_QUEUE then return end
+    nType=nType or "info"
+    if nType~="error" and nType~="success" then
+        local now=tick()
+        -- FIX: purge agressivo se cache fica grande
+        if _notifDebounceEntryCount>NOTIF_DEBOUNCE_MAX_ENTRIES or now-_notifDebouncePurgeT>20 then
+            _notifDebouncePurgeT=now; _notifDebounceEntryCount=0
+            for k,t in pairs(_notifDebounce) do if now-t>NOTIF_DEBOUNCE_T*2 then _notifDebounce[k]=nil else _notifDebounceEntryCount=_notifDebounceEntryCount+1 end end
+        end
+        local debounceKey=nType..":"..msg
+        local last=_notifDebounce[debounceKey]
+        if last and (now-last)<NOTIF_DEBOUNCE_T then return end
+        if not _notifDebounce[debounceKey] then _notifDebounceEntryCount=_notifDebounceEntryCount+1 end
+        _notifDebounce[debounceKey]=now
+    end
+    if notifTail>=notifHead then local last=notifQueue[notifTail]; if last and last.msg==msg and last.nType==nType then last.count=last.count+1; return end end
+    notifTail=notifTail+1; notifQueue[notifTail]={msg=msg,nType=nType,duration=duration or 3.5,count=1}
+end
+
+task.spawn(function()
+    while isRunning do
+        task.wait(NOTIF_INTERVAL)
+        if not NotifContainer then continue end
+        if notifHead>notifTail then continue end
+        if activeNotifCount>=NOTIF_MAX_SCREEN then continue end
+        local item=notifQueue[notifHead]; notifQueue[notifHead]=nil; notifHead=notifHead+1
+        if notifHead>notifTail then for i=notifHead,notifTail do notifQueue[i]=nil end; notifHead=1; notifTail=0 end
+        local displayMsg=item.msg; if item.count and item.count>1 then displayMsg=item.msg.." (x"..item.count..")" end
+        activeNotifCount=activeNotifCount+1; notifOrderCount=notifOrderCount+1
+        local ok=pcall(function()
+            local fr=Instance.new("Frame"); fr.Size=UDim2.new(1,0,0,0); fr.BackgroundColor3=Color3.fromRGB(20,20,30)
+            fr.BorderSizePixel=0; fr.ClipsDescendants=true; fr.LayoutOrder=notifOrderCount; fr.Parent=NotifContainer
+            Instance.new("UICorner",fr).CornerRadius=UDim.new(0,6)
+            local bar=Instance.new("Frame",fr); bar.Size=UDim2.new(0,4,1,0); bar.BorderSizePixel=0
+            bar.BackgroundColor3=NOTIF_COLORS[item.nType] or NOTIF_COLORS.info
+            Instance.new("UICorner",bar).CornerRadius=UDim.new(0,6)
+            local lbl=Instance.new("TextLabel",fr); lbl.Size=UDim2.new(1,-16,1,0); lbl.Position=UDim2.new(0,12,0,0)
+            lbl.BackgroundTransparency=1; lbl.TextColor3=Color3.fromRGB(220,220,230); lbl.TextSize=13
+            lbl.Font=Enum.Font.GothamMedium; lbl.Text=displayMsg; lbl.TextWrapped=true; lbl.TextXAlignment=Enum.TextXAlignment.Left
+            TweenService:Create(fr,TweenInfo.new(0.2,Enum.EasingStyle.Back,Enum.EasingDirection.Out),{Size=UDim2.new(1,0,0,44)}):Play()
+            task.delay(item.duration,function()
+                activeNotifCount=max(0,activeNotifCount-1)
+                if not fr or not fr.Parent then return end
+                TweenService:Create(fr,TweenInfo.new(0.25),{Size=UDim2.new(1,0,0,0),BackgroundTransparency=1}):Play()
+                TweenService:Create(lbl,TweenInfo.new(0.25),{TextTransparency=1}):Play()
+                task.delay(0.3,function() if fr and fr.Parent then fr:Destroy() end end)
+            end)
+        end)
+        if not ok then activeNotifCount=max(0,activeNotifCount-1) end
+    end
+end)
+
+-- ================================================================
+-- 3. POOLS DE DRAWING
+-- ================================================================
+local _dummyMeta={__index=function()return function()end end,__newindex=function()end}
+local _dummySingleton=setmetatable({},_dummyMeta)
+local function makeDummyDrawing() return _dummySingleton end
+local function makeDrawing(dtype,props,isPoolDrawing)
+    if not HAS_DRAWING then return makeDummyDrawing() end
+    local d=Drawing.new(dtype); d.Visible=false
+    if props then pcall(function() for k,v in pairs(props) do d[k]=v end end) end
+    if isPoolDrawing then Lib.AllPoolDrawings[#Lib.AllPoolDrawings+1]=d else Lib.Drawings[#Lib.Drawings+1]=d end
+    return d
+end
+local function initDrawingPool(pool,count,dtype,props) for _=1,count do pool[#pool+1]=makeDrawing(dtype,props,true) end end
+initDrawingPool(Lib.ESPPool,80,"Square",{Filled=false,Thickness=1})
+initDrawingPool(Lib.CornerPool,520,"Line",{Thickness=1.5})
+initDrawingPool(Lib.TracerPool,80,"Line",{Thickness=1})
+initDrawingPool(Lib.SkeletonPool,400,"Line",{Thickness=1})
+initDrawingPool(Lib.LabelPool,150,"Text",{Size=13,Center=true,Outline=true,OutlineColor=_C_BLACK})
+for _=1,50 do local bg=makeDrawing("Square",{Filled=true,Thickness=0,Color=Color3.fromRGB(30,30,30)},true); local fill=makeDrawing("Square",{Filled=true,Thickness=0},true); Lib.HBPool[#Lib.HBPool+1]={bg=bg,fill=fill} end
+for _=1,50 do Lib.HeadDotPool[#Lib.HeadDotPool+1]=makeDrawing("Circle",{Filled=true,Thickness=0,NumSides=16,Color=_C_WHITE,Radius=4},true) end
+
+local MAX_HIGHLIGHTS=28
+for _,obj in ipairs(workspace:GetChildren()) do if obj:IsA("Highlight") and obj.Name:sub(1,8)=="PhantHL_" then pcall(function() obj:Destroy() end) end end
+for i=1,MAX_HIGHLIGHTS do local h=Instance.new("Highlight"); h.Enabled=false; h.Name="PhantHL_"..tostring(i); h.Parent=workspace; Lib.HighlightPool[#Lib.HighlightPool+1]=h end
+
+local _poolESP=Lib.ESPPool; local _poolTracer=Lib.TracerPool; local _poolLabel=Lib.LabelPool
+local _poolHB=Lib.HBPool; local _poolCorner=Lib.CornerPool; local _poolSkel=Lib.SkeletonPool
+local _poolHDot=Lib.HeadDotPool; local _activeESP=Lib.ActiveESP; local _activeCorners=Lib.ActiveCorners
+local _activeTracers=Lib.ActiveTracers; local _activeSkel=Lib.ActiveSkeleton; local _activeLabels=Lib.ActiveLabels
+local _activeHB=Lib.ActiveHB; local _activeHDots=Lib.ActiveHeadDots; local _activeHL=Lib.ActiveHighlights
+
+local function poolGet(pool,dtype) local n=#pool; if n>0 then local obj=pool[n]; pool[n]=nil; return obj end; return makeDrawing(dtype,{},true) end
+local function poolReturn(pool,obj,poolName)
+    if obj==_dummySingleton then return end
+    local maxSize=poolName and POOL_MAX[poolName] or 150
+    if #pool>=maxSize then
+        pcall(function() if obj and obj.Remove then obj:Remove() end end)
+        return
+    end
+    obj.Visible=false
+    pool[#pool+1]=obj
+end
+
+local _cornerPosCache=setmetatable({},{__mode="k"}); local CORNER_POS_THRESH=0.5
+local function getCornerLines()
+    local pool=_poolCorner; local lines={}
+    for i=1,8 do local n=#pool; if n>0 then lines[i]=pool[n]; pool[n]=nil else lines[i]=makeDrawing("Line",{Thickness=1.5},true) end end
+    return lines
+end
+local function releaseCornerLines(lines)
+    local pool=_poolCorner; local poolMaxSize=POOL_MAX.CornerPool
+    for i=1,8 do
+        local l=lines[i]
+        if l and l~=_dummySingleton then
+            if #pool<poolMaxSize then
+                l.Visible=false
+                pool[#pool+1]=l
+            else
+                pcall(function() if l and l.Remove then l:Remove() end end)
+            end
+        end
+    end
+end
+
+local _skelLineScratch={}
+local function getSkeletonLines(count)
+    local pool=_poolSkel
+    for i=1,count do local n=#pool; if n>0 then _skelLineScratch[i]=pool[n]; pool[n]=nil else _skelLineScratch[i]=makeDrawing("Line",{},true) end end
+    for i=count+1,#_skelLineScratch do _skelLineScratch[i]=nil end; return _skelLineScratch
+end
+local function releaseSkeletonLines(lines)
+    local pool=_poolSkel; local poolMaxSize=POOL_MAX.SkeletonPool
+    for i=1,#lines do
+        local l=lines[i]
+        if l and l~=_dummySingleton then
+            if #pool<poolMaxSize then
+                l.Visible=false
+                pool[#pool+1]=l
+            else
+                pcall(function() if l and l.Remove then l:Remove() end end)
+            end
+        end
+    end
+end
+
+local function getHighlight(char)
+    if _activeHL[char] then return _activeHL[char] end
+    if highlightCount>=MAX_HIGHLIGHTS then return nil end
+    local n=#Lib.HighlightPool; if n==0 then return nil end
+    local h=Lib.HighlightPool[n]; Lib.HighlightPool[n]=nil
+    h.Enabled=false; h.Adornee=char; h.Parent=workspace
+    h.DepthMode=Enum.HighlightDepthMode.AlwaysOnTop; h.FillColor=Config.ChamFillColor
+    h.OutlineColor=Config.ChamOutlineColor; h.FillTransparency=0.48+math.random()*0.04
+    h.OutlineTransparency=0; h.Enabled=true; _activeHL[char]=h; highlightCount=highlightCount+1; return h
+end
+local function releaseHighlight(char)
+    local h=_activeHL[char]; if not h then return end
+    h.Enabled=false; h.Adornee=workspace; Lib.HighlightPool[#Lib.HighlightPool+1]=h; _activeHL[char]=nil; highlightCount=highlightCount-1
+end
+
+local function clearPlayerESP(player,char)
+    local ae=_activeESP[player]; if ae then ae.Visible=false; _poolESP[#_poolESP+1]=ae; _activeESP[player]=nil end
+    local ac=_activeCorners[player]; if ac then releaseCornerLines(ac); _activeCorners[player]=nil; _cornerPosCache[player]=nil end
+    local at=_activeTracers[player]; if at then at.Visible=false; _poolTracer[#_poolTracer+1]=at; _activeTracers[player]=nil end
+    local as=_activeSkel[player]; if as then releaseSkeletonLines(as); _activeSkel[player]=nil end
+    local lb=_activeLabels[player]
+    if lb then lb.name.Visible=false; lb.dist.Visible=false; _poolLabel[#_poolLabel+1]=lb.name; _poolLabel[#_poolLabel+1]=lb.dist; _activeLabels[player]=nil end
+    local hb=_activeHB[player]; if hb then _activeHB[player]=nil; hb.bg.Visible=false; hb.fill.Visible=false; _poolHB[#_poolHB+1]=hb end
+    if char then
+        releaseHighlight(char)
+        local vc=_inVehicleEventConns[char]
+        if vc then pcall(function() vc[1]:Disconnect() end); pcall(function() vc[2]:Disconnect() end); _inVehicleEventConns[char]=nil end
+        if player then _playerVehicleChar[player]=nil end
+        local ccc=_charCacheConns[char]; if ccc then pcall(function() ccc:Disconnect() end); _charCacheConns[char]=nil end
+        local bcc=_boneCacheConns[char]; if bcc then pcall(function() bcc:Disconnect() end); _boneCacheConns[char]=nil end
+        _charCache[char]=nil; _boneCache[char]=nil; _visCache[char]=nil; _inVehicleCache[char]=nil
+    end
+    local hd=_activeHDots[player]; if hd then hd.Visible=false; _poolHDot[#_poolHDot+1]=hd; _activeHDots[player]=nil end
+    _weaponCache[player]=nil
+end
+
+-- ================================================================
+-- 4. UI / UX COMPLETO
+-- ================================================================
+local COLORS; local TI_FAST,TI_MED,TI_BACK; local ScreenGui,MainFrame
+local isMenuOpen=false; local UIComponents={}; local _tanHalfCamFOV
+local _crosshairVPCache=Vector2.new(); local _fovLines={}
+local FOV_ELLIPSE_SEGS; local _fovPreCos={}; local _fovPreSin={}
+local CombatFrame,VisualsFrame,PlayersFrame,SettingsFrame  -- hoisted: seção 8 também usa
+
+local saveConfig=function() if Config.DebugMode then warn("PHANTOM: saveConfig chamada antes de inicializar") end end
+local saveConfigSilent=function() end
+local _activeDragFn=nil; local _globalDragMove=nil; local _globalDragEnd=nil
+
+local _espAnyActive=false
+local function _updateESPAnyActive()
+    _espAnyActive=Config.ESPEnabled or Config.ChamEnabled or Config.TracerEnabled or Config.SkeletonEnabled or Config.LabelsEnabled or Config.HealthBarEnabled
+end
+
+local _cachedWFOV,_cachedWDist,_cachedWHP,_cachedWInvTotal=100,25,15,1/140
+local function _updateScoreWeightCache()
+    local wF=max(Config.ScoreWeightFOV,0); local wD=max(Config.ScoreWeightDist,0); local wH=max(Config.ScoreWeightHP,0)
+    local total=wF+wD+wH; if total<1 then total=1 end
+    _cachedWFOV=wF; _cachedWDist=wD; _cachedWHP=wH; _cachedWInvTotal=1/total
+end
+_updateScoreWeightCache()
+
+;(function()
+
+COLORS={
+    bg_main=Color3.fromRGB(14,14,20),bg_card=Color3.fromRGB(20,20,30),bg_hover=Color3.fromRGB(30,30,45),
+    accent=Color3.fromRGB(100,80,220),accent_h=Color3.fromRGB(120,100,240),
+    text_main=Color3.fromRGB(220,220,235),text_sub=Color3.fromRGB(130,130,150),
+    border=Color3.fromRGB(40,40,60),green=Color3.fromRGB(60,200,100),
+    yellow=Color3.fromRGB(220,180,40),red=Color3.fromRGB(220,60,60),
+}
+TI_FAST=TweenInfo.new(0.15,Enum.EasingStyle.Quad,Enum.EasingDirection.Out)
+TI_MED=TweenInfo.new(0.2,Enum.EasingStyle.Quad,Enum.EasingDirection.Out)
+TI_BACK=TweenInfo.new(0.3,Enum.EasingStyle.Back,Enum.EasingDirection.Out)
+
+ScreenGui=Instance.new("ScreenGui")
+local _guiRandNames={"SystemFrame","GameUI","ClientFrame","RenderFrame","InterfaceLayer","HUDFrame"}
+ScreenGui.Name=_guiRandNames[math.random(1,#_guiRandNames)]..tostring(LocalPlayer.UserId%9973)
+ScreenGui.ResetOnSpawn=false; ScreenGui.ZIndexBehavior=Enum.ZIndexBehavior.Sibling
+ScreenGui.IgnoreGuiInset=true; ScreenGui.Parent=LocalPlayer.PlayerGui
+
+NotifContainer=Instance.new("Frame",ScreenGui)
+NotifContainer.Size=UDim2.new(0,280,1,0); NotifContainer.Position=UDim2.new(1,-290,0,0)
+NotifContainer.BackgroundTransparency=1
+local NLayout=Instance.new("UIListLayout",NotifContainer)
+NLayout.VerticalAlignment=Enum.VerticalAlignment.Bottom; NLayout.Padding=UDim.new(0,6)
+
+MainFrame=Instance.new("Frame",ScreenGui); MainFrame.Name="MainFrame"
+MainFrame.Size=UDim2.new(0,540,0,380); MainFrame.Position=UDim2.new(0.5,-270,0.5,-190)
+MainFrame.BackgroundColor3=COLORS.bg_main; MainFrame.BorderSizePixel=0; MainFrame.Visible=false; MainFrame.ClipsDescendants=false
+Instance.new("UICorner",MainFrame).CornerRadius=UDim.new(0,8)
+local MainGrad=Instance.new("UIGradient",MainFrame)
+MainGrad.Color=ColorSequence.new({ColorSequenceKeypoint.new(0,Color3.fromRGB(22,18,35)),ColorSequenceKeypoint.new(1,COLORS.bg_main)})
+MainGrad.Rotation=90
+local MainStroke=Instance.new("UIStroke",MainFrame)
+MainStroke.Color=Color3.fromRGB(60,50,90); MainStroke.Thickness=1; MainStroke.Transparency=0.5
+
+local TitleBar=Instance.new("Frame",MainFrame); TitleBar.Name="TitleBar"
+TitleBar.Size=UDim2.new(1,0,0,34); TitleBar.BackgroundColor3=Color3.fromRGB(18,14,30); TitleBar.BorderSizePixel=0
+Instance.new("UICorner",TitleBar).CornerRadius=UDim.new(0,8)
+local TitleLabel=Instance.new("TextLabel",TitleBar)
+TitleLabel.Size=UDim2.new(1,-50,1,0); TitleLabel.Position=UDim2.new(0,18,0,0); TitleLabel.BackgroundTransparency=1
+TitleLabel.TextColor3=COLORS.text_main; TitleLabel.TextSize=14; TitleLabel.Font=Enum.Font.GothamBold
+TitleLabel.Text="PHANTOM  v3.2"; TitleLabel.TextXAlignment=Enum.TextXAlignment.Left
+
+local ProfileLabel=Instance.new("TextLabel",TitleBar)
+ProfileLabel.Size=UDim2.new(0,120,1,0); ProfileLabel.Position=UDim2.new(1,-130,0,0); ProfileLabel.BackgroundTransparency=1
+ProfileLabel.TextColor3=COLORS.text_sub; ProfileLabel.TextSize=11; ProfileLabel.Font=Enum.Font.Gotham
+ProfileLabel.Text=""; ProfileLabel.TextXAlignment=Enum.TextXAlignment.Right
+function Lib._profileLabel() ProfileLabel.Text=Config.ActiveProfile and ("Perfil: "..Config.ActiveProfile) or "" end
+
+local StatusDot=Instance.new("Frame",TitleBar); StatusDot.Name="StatusDot"
+StatusDot.Size=UDim2.new(0,8,0,8); StatusDot.Position=UDim2.new(0,4,0.5,-4)
+StatusDot.BackgroundColor3=Color3.fromRGB(80,80,100); StatusDot.BorderSizePixel=0
+Instance.new("UICorner",StatusDot).CornerRadius=UDim.new(1,0)
+function Lib._statusDot()
+    if Config.AimbotEnabled then StatusDot.BackgroundColor3=Color3.fromRGB(60,220,80)
+    elseif Config.ESPEnabled or Config.TracerEnabled or Config.SkeletonEnabled then StatusDot.BackgroundColor3=Color3.fromRGB(220,180,40)
+    else StatusDot.BackgroundColor3=Color3.fromRGB(80,80,100) end
+end
+Lib._statusDot()
+
+local TooltipFrame=Instance.new("Frame",ScreenGui)
+TooltipFrame.Size=UDim2.new(0,200,0,24); TooltipFrame.BackgroundColor3=Color3.fromRGB(24,22,38)
+TooltipFrame.BorderSizePixel=0; TooltipFrame.Visible=false; TooltipFrame.ZIndex=20
+Instance.new("UICorner",TooltipFrame).CornerRadius=UDim.new(0,4)
+local _tipStroke=Instance.new("UIStroke",TooltipFrame); _tipStroke.Color=Color3.fromRGB(80,60,140); _tipStroke.Thickness=1
+local TooltipLabel=Instance.new("TextLabel",TooltipFrame)
+TooltipLabel.Size=UDim2.new(1,-8,1,0); TooltipLabel.Position=UDim2.new(0,4,0,0); TooltipLabel.BackgroundTransparency=1
+TooltipLabel.TextColor3=COLORS.text_main; TooltipLabel.TextSize=11; TooltipLabel.Font=Enum.Font.Gotham
+TooltipLabel.TextXAlignment=Enum.TextXAlignment.Left; TooltipLabel.ZIndex=21
+
+local _tooltipMoveConn=UserInputService.InputChanged:Connect(function(inp)
+    if not TooltipFrame.Visible then return end
+    if inp.UserInputType==Enum.UserInputType.MouseMovement then
+        TooltipFrame.Position=UDim2.new(0,inp.Position.X+14,0,inp.Position.Y-4)
+    end
+end)
+Lib.Connections[#Lib.Connections+1]=_tooltipMoveConn
+
+local function showTooltip(text,mx,my)
+    TooltipLabel.Text=text; local tipW=#text*6+12; local tipH=22
+    TooltipFrame.Size=UDim2.new(0,tipW,0,tipH)
+    local vp=Camera.ViewportSize
+    local tx=(mx+14+tipW>vp.X) and (mx-tipW-6) or (mx+14)
+    local ty=(my-4+tipH>vp.Y) and (vp.Y-tipH-4) or (my-4)
+    TooltipFrame.Position=UDim2.new(0,tx,0,ty); TooltipFrame.Visible=true
+end
+local function hideTooltip() TooltipFrame.Visible=false end
+
+local tweenOpen=TweenService:Create(MainFrame,TI_BACK,{Size=UDim2.new(0,540,0,380)})
+local tweenClose=TweenService:Create(MainFrame,TI_MED,{Size=UDim2.new(0,0,0,0)})
+tweenClose.Completed:Connect(function() MainFrame.Visible=false end)
+function Lib._openMenu() isMenuOpen=true; MainFrame.Size=UDim2.new(0,0,0,0); MainFrame.Visible=true; tweenOpen:Play(); UserInputService.MouseBehavior=Enum.MouseBehavior.Default end
+function Lib._closeMenu() isMenuOpen=false; tweenClose:Play() end
+
+local draggingWindow=false; local dragOffset=Vector2.new(); local _lastTitleClick=0
+TitleBar.InputBegan:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then
+        local now=tick(); if now-_lastTitleClick<0.35 then Lib._closeMenu(); return end
+        _lastTitleClick=now; draggingWindow=true
+        dragOffset=Vector2.new(inp.Position.X-MainFrame.AbsolutePosition.X,inp.Position.Y-MainFrame.AbsolutePosition.Y)
+    end
+end)
+TitleBar.InputEnded:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then draggingWindow=false end
+end)
+local dragConn=UserInputService.InputChanged:Connect(function(inp)
+    if not draggingWindow then return end
+    if inp.UserInputType~=Enum.UserInputType.MouseMovement and inp.UserInputType~=Enum.UserInputType.Touch then return end
+    local vp=Camera.ViewportSize
+    local nx=clamp(inp.Position.X-dragOffset.X,0,vp.X-MainFrame.AbsoluteSize.X)
+    local ny=clamp(inp.Position.Y-dragOffset.Y,0,vp.Y-MainFrame.AbsoluteSize.Y)
+    MainFrame.Position=UDim2.new(0,nx,0,ny)
+end)
+Lib.Connections[#Lib.Connections+1]=dragConn
+
+_globalDragMove=UserInputService.InputChanged:Connect(function(inp)
+    if not _activeDragFn then return end
+    if inp.UserInputType==Enum.UserInputType.MouseMovement or inp.UserInputType==Enum.UserInputType.Touch then _activeDragFn(inp.Position.X) end
+end)
+_globalDragEnd=UserInputService.InputEnded:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 or inp.UserInputType==Enum.UserInputType.Touch then _activeDragFn=nil end
+end)
+Lib.Connections[#Lib.Connections+1]=_globalDragMove; Lib.Connections[#Lib.Connections+1]=_globalDragEnd
+
+local Tabs={}; local activeTab=nil
+
+local TabBar=Instance.new("Frame",MainFrame); TabBar.Name="TabBar"
+TabBar.Size=UDim2.new(0,110,1,-34); TabBar.Position=UDim2.new(0,0,0,34)
+TabBar.BackgroundColor3=Color3.fromRGB(16,12,25); TabBar.BorderSizePixel=0
+Instance.new("UICorner",TabBar).CornerRadius=UDim.new(0,8)
+local TabLayout=Instance.new("UIListLayout",TabBar); TabLayout.SortOrder=Enum.SortOrder.LayoutOrder; TabLayout.Padding=UDim.new(0,2)
+local TabPadding=Instance.new("UIPadding",TabBar)
+TabPadding.PaddingTop=UDim.new(0,8); TabPadding.PaddingLeft=UDim.new(0,6); TabPadding.PaddingRight=UDim.new(0,6)
+
+local ContentArea=Instance.new("Frame",MainFrame)
+ContentArea.Size=UDim2.new(1,-118,1,-42); ContentArea.Position=UDim2.new(0,114,0,38)
+ContentArea.BackgroundTransparency=1; ContentArea.ClipsDescendants=true
+
+local function switchTab(name)
+    if activeTab and Tabs[activeTab] then
+        local old=Tabs[activeTab]; old.Frame.Visible=false
+        TweenService:Create(old.Button,TI_MED,{BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1}):Play()
+    end
+    local new=Tabs[name]; new.Frame.Visible=true
+    TweenService:Create(new.Button,TI_MED,{BackgroundColor3=COLORS.accent,BackgroundTransparency=0}):Play()
+    activeTab=name
+end
+
+local function createTab(name,icon,order)
+    local btn=Instance.new("TextButton",TabBar); btn.Size=UDim2.new(1,0,0,34); btn.BackgroundTransparency=1
+    btn.BackgroundColor3=COLORS.accent; btn.TextColor3=COLORS.text_main; btn.TextSize=12
+    btn.Font=Enum.Font.GothamMedium; btn.Text=icon.."  "..name; btn.BorderSizePixel=0; btn.LayoutOrder=order
+    Instance.new("UICorner",btn).CornerRadius=UDim.new(0,6)
+    local twTabHover=TweenService:Create(btn,TI_FAST,{BackgroundTransparency=0.7})
+    local twTabLeave=TweenService:Create(btn,TI_FAST,{BackgroundTransparency=1})
+    btn.MouseEnter:Connect(function() if activeTab~=name then twTabHover:Play() end end)
+    btn.MouseLeave:Connect(function() if activeTab~=name then twTabLeave:Play() end end)
+    local frame=Instance.new("ScrollingFrame",ContentArea)
+    frame.Size=UDim2.new(1,0,1,0); frame.BackgroundTransparency=1; frame.BorderSizePixel=0
+    frame.ScrollBarThickness=3; frame.ScrollBarImageColor3=COLORS.accent
+    frame.CanvasSize=UDim2.new(0,0,0,0); frame.AutomaticCanvasSize=Enum.AutomaticSize.Y; frame.Visible=false
+    local fl=Instance.new("UIListLayout",frame); fl.SortOrder=Enum.SortOrder.LayoutOrder; fl.Padding=UDim.new(0,4)
+    local fp=Instance.new("UIPadding",frame)
+    fp.PaddingTop=UDim.new(0,4); fp.PaddingLeft=UDim.new(0,4); fp.PaddingRight=UDim.new(0,8); fp.PaddingBottom=UDim.new(0,8)
+    Tabs[name]={Button=btn,Frame=frame}; btn.MouseButton1Click:Connect(function() switchTab(name) end); return frame
+end
+
+CombatFrame=createTab("Combat","⚔",1); VisualsFrame=createTab("Visuals","👁",2)
+PlayersFrame=createTab("Players","👥",3); SettingsFrame=createTab("Settings","⚙",4)
+
+UIComponents={}
+function Lib._updateAllUI()
+    for key,comp in pairs(UIComponents) do if comp.setValue and Config[key]~=nil then pcall(comp.setValue,Config[key]) end end
+    pcall(function() Lib._fovCircle() end); pcall(function() Lib._xhair() end); Lib._profileLabel()
+end
+
+local _ESP_VISUAL_KEYS={ESPEnabled=true,ChamEnabled=true,TracerEnabled=true,SkeletonEnabled=true,LabelsEnabled=true,HealthBarEnabled=true}
+
+local function createToggle(parent,label,configKey,callback,tooltip)
+    local row=Instance.new("Frame",parent); row.Size=UDim2.new(1,0,0,36); row.BackgroundTransparency=1
+    local lbl=Instance.new("TextLabel",row); lbl.Size=UDim2.new(1,-60,1,0); lbl.BackgroundTransparency=1
+    lbl.TextColor3=COLORS.text_main; lbl.TextSize=13; lbl.Font=Enum.Font.GothamMedium
+    lbl.Text=label; lbl.TextXAlignment=Enum.TextXAlignment.Left
+    local track=Instance.new("Frame",row); track.Size=UDim2.new(0,44,0,24); track.Position=UDim2.new(1,-50,0.5,-12)
+    track.BackgroundColor3=Color3.fromRGB(50,50,65); track.BorderSizePixel=0
+    Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
+    local knob=Instance.new("Frame",track); knob.Size=UDim2.new(0,18,0,18); knob.Position=UDim2.new(0,3,0.5,-9)
+    knob.BackgroundColor3=Color3.fromRGB(200,200,210); knob.BorderSizePixel=0
+    Instance.new("UICorner",knob).CornerRadius=UDim.new(1,0)
+    local twON=TweenService:Create(knob,TI_MED,{Position=UDim2.new(0,23,0.5,-9)})
+    local twTON=TweenService:Create(track,TI_MED,{BackgroundColor3=COLORS.accent})
+    local twOFF=TweenService:Create(knob,TI_MED,{Position=UDim2.new(0,3,0.5,-9)})
+    local twTOFF=TweenService:Create(track,TI_MED,{BackgroundColor3=Color3.fromRGB(50,50,65)})
+    local btn=Instance.new("TextButton",track); btn.Size=UDim2.new(1,0,1,0); btn.BackgroundTransparency=1; btn.Text=""
+    local function setValue(v)
+        Config[configKey]=v; if v then twON:Play(); twTON:Play() else twOFF:Play(); twTOFF:Play() end
+    end
+    btn.MouseButton1Click:Connect(function()
+        setValue(not Config[configKey]); configDirty=true
+        if _ESP_VISUAL_KEYS[configKey] then _updateESPAnyActive() end
+        if callback then callback(Config[configKey]) end
+    end)
+    setValue(Config[configKey]); UIComponents[configKey]={setValue=setValue}
+    if tooltip then lbl.MouseEnter:Connect(function(mx,my) showTooltip(tooltip,mx,my) end); lbl.MouseLeave:Connect(hideTooltip) end
+    return row
+end
+
+-- ================================================================
+-- createSlider CORRIGIDO (FIX: nil Config, zero falsy, div/zero)
+-- ================================================================
+local function createSlider(parent, label, minV, maxV, configKey, callback, tooltip)
+    minV = type(minV)=="number" and minV or 0
+    maxV = type(maxV)=="number" and maxV or 100
+    local row=Instance.new("Frame",parent)
+    row.Size=UDim2.new(1,0,0,50); row.BackgroundTransparency=1
+    local lbl=Instance.new("TextLabel",row)
+    lbl.Size=UDim2.new(0.65,0,0,20); lbl.BackgroundTransparency=1
+    lbl.TextColor3=COLORS.text_main; lbl.TextSize=13; lbl.Font=Enum.Font.GothamMedium
+    lbl.Text=label; lbl.TextXAlignment=Enum.TextXAlignment.Left
+    local valLbl=Instance.new("TextLabel",row)
+    valLbl.Size=UDim2.new(0.35,0,0,20); valLbl.Position=UDim2.new(0.65,0,0,0)
+    valLbl.BackgroundTransparency=1; valLbl.TextColor3=COLORS.accent
+    valLbl.TextSize=13; valLbl.Font=Enum.Font.GothamBold; valLbl.TextXAlignment=Enum.TextXAlignment.Right
+    local track=Instance.new("Frame",row)
+    track.Size=UDim2.new(1,0,0,6); track.Position=UDim2.new(0,0,1,-10)
+    track.BackgroundColor3=Color3.fromRGB(50,50,65); track.BorderSizePixel=0
+    Instance.new("UICorner",track).CornerRadius=UDim.new(1,0)
+    local fill=Instance.new("Frame",track)
+    fill.BackgroundColor3=COLORS.accent; fill.BorderSizePixel=0; fill.Size=UDim2.new(0,0,1,0)
+    Instance.new("UICorner",fill).CornerRadius=UDim.new(1,0)
+    local thumb=Instance.new("Frame",track)
+    thumb.Size=UDim2.new(0,16,0,16); thumb.AnchorPoint=Vector2.new(0.5,0.5)
+    thumb.BackgroundColor3=Color3.fromRGB(220,215,255); thumb.BorderSizePixel=0
+    Instance.new("UICorner",thumb).CornerRadius=UDim.new(1,0)
+    local range=maxV-minV
+    local safeRange=range~=0 and range or 1  -- FIX: evita divisão por zero
+    local function setPct(pct)
+        pct=clamp(pct,0,1)
+        local val=floor(minV+range*pct)
+        if configKey then Config[configKey]=val; configDirty=true end
+        fill.Size=UDim2.new(pct,0,1,0); thumb.Position=UDim2.new(pct,0,0.5,0); valLbl.Text=tostring(val)
+        if callback then callback(val) end
+    end
+    local function setValue(v)
+        local safe=type(v)=="number" and v or minV  -- FIX: type check explícito (zero não é falsy)
+        local pct=clamp((safe-minV)/safeRange,0,1)
+        if configKey then Config[configKey]=safe end
+        fill.Size=UDim2.new(pct,0,1,0); thumb.Position=UDim2.new(pct,0,0.5,0); valLbl.Text=tostring(safe)
+    end
+    -- FIX: verificação explícita de tipo — evita crash quando Config[configKey] é nil
+    local initVal=minV
+    if configKey and type(Config[configKey])=="number" then
+        initVal=Config[configKey]
+    end
+    setValue(initVal)
+    if configKey then UIComponents[configKey]={setValue=setValue} end
+    local function onDragX(x) setPct((x-track.AbsolutePosition.X)/track.AbsoluteSize.X) end
+    track.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            _activeDragFn=onDragX; onDragX(i.Position.X)
+        end
+    end)
+    thumb.InputBegan:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 then _activeDragFn=onDragX end
+    end)
+    if tooltip then lbl.MouseEnter:Connect(function(mx,my) showTooltip(tooltip,mx,my) end); lbl.MouseLeave:Connect(hideTooltip) end
+    return row
+end
+
+local _openDropdownLists={}
+local function createDropdown(parent,label,options,configKey,callback)
+    local row=Instance.new("Frame",parent); row.Size=UDim2.new(1,0,0,36); row.BackgroundTransparency=1; row.ClipsDescendants=false
+    local lbl=Instance.new("TextLabel",row); lbl.Size=UDim2.new(0.5,0,0,36); lbl.BackgroundTransparency=1
+    lbl.TextColor3=COLORS.text_main; lbl.TextSize=13; lbl.Font=Enum.Font.GothamMedium; lbl.Text=label; lbl.TextXAlignment=Enum.TextXAlignment.Left
+    local dBtn=Instance.new("TextButton",row); dBtn.Size=UDim2.new(0.46,0,0,26); dBtn.Position=UDim2.new(0.54,0,0.5,-13)
+    dBtn.BackgroundColor3=COLORS.bg_card; dBtn.TextColor3=COLORS.accent; dBtn.TextSize=12
+    dBtn.Font=Enum.Font.GothamMedium; dBtn.Text=tostring(Config[configKey]).." ▾"; dBtn.BorderSizePixel=0
+    Instance.new("UICorner",dBtn).CornerRadius=UDim.new(0,4)
+    local nOpts=#options
+    local list=Instance.new("Frame",row); list.Size=UDim2.new(0.46,0,0,nOpts*26); list.Position=UDim2.new(0.54,0,0,36)
+    list.BackgroundColor3=COLORS.bg_card; list.BorderSizePixel=0; list.Visible=false; list.ZIndex=20
+    Instance.new("UICorner",list).CornerRadius=UDim.new(0,4); Instance.new("UIListLayout",list).SortOrder=Enum.SortOrder.LayoutOrder
+    local ls=Instance.new("UIStroke",list); ls.Color=COLORS.accent; ls.Thickness=1; ls.Transparency=0.5
+    for i=1,nOpts do
+        local opt=options[i]; local ob=Instance.new("TextButton",list)
+        ob.Size=UDim2.new(1,0,0,26); ob.BackgroundTransparency=1; ob.TextColor3=COLORS.text_main
+        ob.TextSize=12; ob.Font=Enum.Font.Gotham; ob.Text=opt; ob.LayoutOrder=i
+        local twHover=TweenService:Create(ob,TI_FAST,{BackgroundTransparency=0,BackgroundColor3=COLORS.bg_hover})
+        local twLeave=TweenService:Create(ob,TI_FAST,{BackgroundTransparency=1})
+        ob.MouseEnter:Connect(function() twHover:Play() end); ob.MouseLeave:Connect(function() twLeave:Play() end)
+        ob.MouseButton1Click:Connect(function() Config[configKey]=opt; dBtn.Text=opt.." ▾"; list.Visible=false; configDirty=true; if callback then callback(opt) end end)
+    end
+    local ddOpen=false
+    dBtn.MouseButton1Click:Connect(function()
+        for _,entry in ipairs(_openDropdownLists) do if entry~=list then entry.Visible=false end end
+        ddOpen=not ddOpen; list.Visible=ddOpen
+    end)
+    _openDropdownLists[#_openDropdownLists+1]=list
+    local function setValue(v) Config[configKey]=v; dBtn.Text=tostring(v).." ▾" end
+    UIComponents[configKey]={setValue=setValue}; return row
+end
+
+local function createColorPicker(parent,label,configKey,callback)
+    local container=Instance.new("Frame",parent); container.Size=UDim2.new(1,0,0,134); container.BackgroundTransparency=1
+    local title=Instance.new("TextLabel",container); title.Size=UDim2.new(0.6,0,0,20); title.BackgroundTransparency=1
+    title.TextColor3=COLORS.text_main; title.TextSize=13; title.Font=Enum.Font.GothamMedium; title.Text=label; title.TextXAlignment=Enum.TextXAlignment.Left
+    local preview=Instance.new("Frame",container); preview.Size=UDim2.new(0,24,0,24); preview.Position=UDim2.new(1,-28,0,0)
+    preview.BackgroundColor3=Config[configKey]; preview.BorderSizePixel=0
+    Instance.new("UICorner",preview).CornerRadius=UDim.new(0,4)
+    local r=floor(Config[configKey].R*255); local g=floor(Config[configKey].G*255); local b=floor(Config[configKey].B*255)
+    local hexBox
+    local function applyColor()
+        local c=Color3.fromRGB(r,g,b); Config[configKey]=c; preview.BackgroundColor3=c
+        if hexBox then hexBox.Text=sfmt("%02X%02X%02X",r,g,b) end; configDirty=true
+        if callback then callback(c) end
+    end
+    local channels={
+        {name="R",getV=function()return r end,setV=function(v)r=v end,col=Color3.fromRGB(200,50,50)},
+        {name="G",getV=function()return g end,setV=function(v)g=v end,col=Color3.fromRGB(50,200,50)},
+        {name="B",getV=function()return b end,setV=function(v)b=v end,col=Color3.fromRGB(50,100,220)},
+    }
+    for i=1,3 do
+        local ch=channels[i]; local rowC=Instance.new("Frame",container)
+        rowC.Size=UDim2.new(1,0,0,20); rowC.Position=UDim2.new(0,0,0,22+(i-1)*28); rowC.BackgroundTransparency=1
+        local cl=Instance.new("TextLabel",rowC); cl.Size=UDim2.new(0,12,1,0); cl.BackgroundTransparency=1
+        cl.TextColor3=ch.col; cl.TextSize=12; cl.Font=Enum.Font.GothamBold; cl.Text=ch.name
+        local tr=Instance.new("Frame",rowC); tr.Size=UDim2.new(1,-50,0,6); tr.Position=UDim2.new(0,18,0.5,-3)
+        tr.BackgroundColor3=Color3.fromRGB(40,40,55); tr.BorderSizePixel=0
+        Instance.new("UICorner",tr).CornerRadius=UDim.new(1,0)
+        local fc=Instance.new("Frame",tr); fc.BackgroundColor3=ch.col; fc.BorderSizePixel=0; fc.Size=UDim2.new(ch.getV()/255,0,1,0)
+        Instance.new("UICorner",fc).CornerRadius=UDim.new(1,0)
+        local vl=Instance.new("TextLabel",rowC); vl.Size=UDim2.new(0,28,1,0); vl.Position=UDim2.new(1,-28,0,0)
+        vl.BackgroundTransparency=1; vl.TextColor3=COLORS.text_sub; vl.TextSize=11; vl.Font=Enum.Font.Code; vl.Text=tostring(ch.getV())
+        local function makeChannelDrag(ch_,fc_,vl_,tr_)
+            return function(x) local pct=clamp((x-tr_.AbsolutePosition.X)/tr_.AbsoluteSize.X,0,1); ch_.setV(floor(pct*255)); fc_.Size=UDim2.new(pct,0,1,0); vl_.Text=tostring(ch_.getV()); applyColor() end
+        end
+        local onColorDragX=makeChannelDrag(ch,fc,vl,tr)
+        tr.InputBegan:Connect(function(inp) if inp.UserInputType==Enum.UserInputType.MouseButton1 then _activeDragFn=onColorDragX end end)
+    end
+    local hexRow=Instance.new("Frame",container); hexRow.Size=UDim2.new(1,0,0,22); hexRow.Position=UDim2.new(0,0,0,108); hexRow.BackgroundTransparency=1
+    local hexLbl=Instance.new("TextLabel",hexRow); hexLbl.Size=UDim2.new(0,30,1,0); hexLbl.BackgroundTransparency=1
+    hexLbl.TextColor3=COLORS.text_sub; hexLbl.TextSize=11; hexLbl.Font=Enum.Font.GothamMedium; hexLbl.Text="HEX"; hexLbl.TextXAlignment=Enum.TextXAlignment.Left
+    hexBox=Instance.new("TextBox",hexRow); hexBox.Size=UDim2.new(0,70,1,0); hexBox.Position=UDim2.new(0,34,0,0)
+    hexBox.BackgroundColor3=COLORS.bg_card; hexBox.TextColor3=COLORS.accent; hexBox.TextSize=11; hexBox.Font=Enum.Font.Code
+    hexBox.PlaceholderText="RRGGBB"; hexBox.PlaceholderColor3=COLORS.text_sub; hexBox.Text=sfmt("%02X%02X%02X",r,g,b)
+    hexBox.ClearTextOnFocus=false; hexBox.BorderSizePixel=0
+    Instance.new("UICorner",hexBox).CornerRadius=UDim.new(0,4)
+    hexBox.FocusLost:Connect(function()
+        local hex=hexBox.Text:match("^%s*#?([0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f])%s*$")
+        if hex then r=tonumber(hex:sub(1,2),16); g=tonumber(hex:sub(3,4),16); b=tonumber(hex:sub(5,6),16); applyColor()
+        else hexBox.Text=sfmt("%02X%02X%02X",r,g,b) end
+    end)
+end
+
+-- FOV Circle
+FOV_ELLIPSE_SEGS=64
+for i=0,FOV_ELLIPSE_SEGS do local a=(i/FOV_ELLIPSE_SEGS)*TWO_PI; _fovPreCos[i]=cos(a); _fovPreSin[i]=sin(a) end
+for _=1,FOV_ELLIPSE_SEGS do _fovLines[#_fovLines+1]=makeDrawing("Line",{Thickness=1.5,Color=_C_WHITE}) end
+
+local fovCircle={Color=_C_WHITE,Visible=false}
+local _lastFovColor=nil
+function Lib._setFovColor(c)
+    -- FIX: pular se cor não mudou — evita iterar 64 linhas desnecessariamente
+    if _lastFovColor and _lastFovColor==c then return end
+    _lastFovColor=c; fovCircle.Color=c
+    for _,l in ipairs(_fovLines) do l.Color=c end
+end
+function Lib._setFovVis(v) fovCircle.Visible=v; for _,l in ipairs(_fovLines) do l.Visible=v end end
+
+local _fovAnimThread=nil; local _lastFovDisplay=-1; local _lastFovCircleVpY=-1; local _lastFovCircleVpX=-1
+local _cachedFovRadiusX=0; local _cachedFovRadiusY=0; local _lastAspectRatio=-1; local _lastNotifiedAspect=""
+local _lastNotifVpX=-1; local _lastNotifVpY=-1  -- FIX: tracking separado para notif de resolução
+local _fovDirty_vis=nil; local _fovDirty_rx=-1; local _fovDirty_ry=-1; local _fovDirty_cx=-1; local _fovDirty_cy=-1
+
+local _ASPECT_TABLE={{1.0,0.03,"1:1"},{1.25,0.03,"5:4"},{1.3333,0.025,"4:3"},{1.6,0.025,"16:10"},{1.7778,0.025,"16:9"},{1.8962,0.030,"17:9"},{2.0,0.03,"18:9 / 2:1"},{2.111,0.03,"19:9"},{2.333,0.04,"21:9"},{2.667,0.05,"24:9"},{3.556,0.07,"32:9"}}
+_detectAspectName=function(vpX,vpY)
+    local r=vpX/vpY; local bestName,bestDiff=nil,huge
+    for _,entry in ipairs(_ASPECT_TABLE) do local diff=abs(r-entry[1]); if diff<entry[2] and diff<bestDiff then bestDiff=diff; bestName=entry[3] end end
+    if not bestName then bestName=sfmt("%.2f:1 (custom)",r) end; return bestName,r
+end
+
+local _fovFullScreen=false
+local function _calcFovRadii(fovDeg,vpX,vpY)
+    if fovDeg>=180 then _fovFullScreen=true; return vpX*0.5,vpY*0.5 end
+    _fovFullScreen=false
+    local safeFov=min(fovDeg,179.9)
+    local tanHalfFov=tan(rad(safeFov*0.5))
+    local radiusY=tanHalfFov/_tanHalfCamFOV*(vpY*0.5)
+    local radiusX=radiusY*(vpX/vpY)
+    -- Clamp ao viewport: acima do FOV da câmera o círculo ultrapassa a tela
+    -- O aimbot continua buscando na área correta, o visual só para na borda
+    local maxRY=vpY*0.499; local maxRX=vpX*0.499
+    if radiusY>maxRY or radiusX>maxRX then
+        _fovFullScreen=true; return vpX*0.5,vpY*0.5
+    end
+    return radiusX,radiusY
+end
+
+function Lib.animFov(targetColor,duration)
+    if not HAS_DRAWING then return end; if _fovAnimThread then task.cancel(_fovAnimThread) end
+    _fovAnimThread=task.spawn(function()
+        local startColor=fovCircle.Color; local steps=20; local stepTime=duration/steps
+        for i=1,steps do if not isRunning then break end; Lib._setFovColor(startColor:Lerp(targetColor,i/steps)); task.wait(stepTime) end
+        Lib._setFovColor(targetColor); _fovAnimThread=nil
+    end)
+end
+
+local function _fovCurveFactor(t)
+    local fn=_FOV_CURVES[Config.FOVCurve]
+    if not fn then if Config.DebugMode then warn("PHANTOM: FOVCurve inválido: "..tostring(Config.FOVCurve).." — usando Sqrt") end; fn=_FOV_CURVES.Sqrt end
+    return fn(t)
+end
+function Lib._getEffFov(dist,state)
+    -- FIX: div/zero quando FOVMinDist==FOVMaxDist
+    local range=Config.FOVMaxDist-Config.FOVMinDist
+    local t=range~=0 and clamp((dist-Config.FOVMinDist)/range,0,1) or 0
+    local base=Config.FOV*(1-_fovCurveFactor(t)*0.75); if state and state.inVehicle then base=base*1.5 end
+    return clamp(base,5,180)
+end
+
+_tanHalfCamFOV=max(tan(rad(min(Camera.FieldOfView,179)/2)),0.001)
+Lib.Connections.FovChanged=Camera:GetPropertyChangedSignal("FieldOfView"):Connect(function()
+    _tanHalfCamFOV=max(tan(rad(min(Camera.FieldOfView,179)/2)),0.001); _lastFovDisplay=-1; _fovDirty_vis=nil
+end)
+
+function Lib._fovCircle(targetDist)
+    if not HAS_DRAWING then return end
+    local vp=Camera.ViewportSize; local vpX=vp.X; local vpY=vp.Y
+    local fovDisplay=Config.FOV
+    if targetDist then
+        if Config.FOVSyncVisual then fovDisplay=Lib._getEffFov(targetDist,bestTargetState)
+        else local t=clamp((targetDist-Config.FOVMinDist)/(Config.FOVMaxDist-Config.FOVMinDist),0,1); fovDisplay=max(Config.FOV*(1-_fovCurveFactor(t)*0.75),5) end
+    end
+    local aspectRatio=vpX/vpY
+    if fovDisplay~=_lastFovDisplay or vpY~=_lastFovCircleVpY or vpX~=_lastFovCircleVpX or aspectRatio~=_lastAspectRatio then
+        _lastFovDisplay=fovDisplay; _lastFovCircleVpY=vpY; _lastFovCircleVpX=vpX; _lastAspectRatio=aspectRatio
+        _cachedFovRadiusX,_cachedFovRadiusY=_calcFovRadii(fovDisplay,vpX,vpY)
+        -- FIX: notificar resolução só quando viewport realmente mudou (não a cada recalc de FOV)
+        if vpX~=_lastNotifVpX or vpY~=_lastNotifVpY then
+            _lastNotifVpX=vpX; _lastNotifVpY=vpY
+            local aspectName,ratio=_detectAspectName(vpX,vpY)
+            if aspectName~=_lastNotifiedAspect then _lastNotifiedAspect=aspectName; notify(sfmt("Resolução: %dx%d → %s (%.3f:1)",vpX,vpY,aspectName,ratio),"info",5) end
+        end
+    end
+    local cx=vpX*0.5; local cy=vpY*0.5; local vis=Config.AimbotEnabled and Config.ShowFOV
+    local rx=_cachedFovRadiusX; local ry=_cachedFovRadiusY
+    if _fovFullScreen then
+        local margin=4
+        if vis~=_fovDirty_vis or cx~=_fovDirty_cx or cy~=_fovDirty_cy then
+            _fovDirty_vis=vis; _fovDirty_rx=-1; _fovDirty_ry=-1; _fovDirty_cx=cx; _fovDirty_cy=cy
+            local lines=_fovLines; local seg=FOV_ELLIPSE_SEGS/4
+            local x1,y1,x2,y2=margin,margin,vpX-margin,vpY-margin
+            for i=0,FOV_ELLIPSE_SEGS-1 do
+                local side=floor(i/seg); local t_=(i%seg)/seg; local t2=(i+1)%FOV_ELLIPSE_SEGS; local side2=floor(t2/seg); local t2_=(t2%seg)/seg
+                local function pt(s,frac) if s==0 then return x1+(x2-x1)*frac,y1 elseif s==1 then return x2,y1+(y2-y1)*frac elseif s==2 then return x2-(x2-x1)*frac,y2 else return x1,y2-(y2-y1)*frac end end
+                local fx,fy=pt(side,t_); local tx_,ty_=pt(side2,t2_)
+                local l=lines[i+1]; l.From=Vector2.new(fx,fy); l.To=Vector2.new(tx_,ty_); l.Visible=vis
+            end
+        end
+        fovCircle.Visible=vis; return
+    end
+    if vis~=_fovDirty_vis or rx~=_fovDirty_rx or ry~=_fovDirty_ry or cx~=_fovDirty_cx or cy~=_fovDirty_cy then
+        _fovDirty_vis=vis; _fovDirty_rx=rx; _fovDirty_ry=ry; _fovDirty_cx=cx; _fovDirty_cy=cy
+        local precos=_fovPreCos; local presin=_fovPreSin; local lines=_fovLines
+        for i=0,FOV_ELLIPSE_SEGS-1 do
+            local l=lines[i+1]; l.From=Vector2.new(cx+precos[i]*rx,cy+presin[i]*ry); l.To=Vector2.new(cx+precos[i+1]*rx,cy+presin[i+1]*ry); l.Visible=vis
+        end
+        fovCircle.Visible=vis
+    end
+end
+
+Lib.Connections.ViewportChanged=Camera:GetPropertyChangedSignal("ViewportSize"):Connect(function() _fovDirty_vis=nil; Lib._fovCircle() end)
+Lib._fovCircle()
+
+-- HUD
+local _hudBg=makeDrawing("Square",{Filled=true,Color=Color3.fromRGB(12,12,20),Transparency=0.3})
+local _hudName=makeDrawing("Text",{Size=14,Center=false,Outline=true,OutlineColor=_C_BLACK})
+local _hudHP=makeDrawing("Text",{Size=12,Center=false,Outline=true,OutlineColor=_C_BLACK})
+local _hudDist=makeDrawing("Text",{Size=11,Center=false,Outline=true,OutlineColor=_C_BLACK})
+local _hudLoS=makeDrawing("Text",{Size=11,Center=false,Outline=true,OutlineColor=_C_BLACK})
+local _lastHudHPPct=-1; local _hudHPText=""; local _lastHudDist=-1; local _hudDistText=""
+local _lastHudVisible=false; local _lastHudLosOk=nil; local _lastHudHPColor=nil
+
+local function _hudHideAll() _hudBg.Visible=false; _hudName.Visible=false; _hudHP.Visible=false; _hudDist.Visible=false; _hudLoS.Visible=false; _lastHudVisible=false end
+local _lastHudName=""; local _lastHudVpX=-1
+
+function Lib._hud(camCF_,vpX_,vpY_)
+    if not HAS_DRAWING then return end
+    if not Config.TargetHUDEnabled or not bestTarget then if _lastHudVisible then _hudHideAll() end; return end
+    local cc=_getCharCache(bestTarget); local hum=cc and cc.hum
+    if not hum then if _lastHudVisible then _hudHideAll() end; return end
+    local hp=max(hum.Health,0)/max(hum.MaxHealth,1)
+    local player=_charToPlayer[bestTarget]; local pname=player and player.DisplayName or "?"
+    local camPos_=camCF_ and camCF_.Position or Camera.CFrame.Position
+    local dist
+    if bestTargetRoot then local _cp=camPos_; local _dx=_cp.X-bestTargetRoot.Position.X; local _dy=_cp.Y-bestTargetRoot.Position.Y; local _dz=_cp.Z-bestTargetRoot.Position.Z; dist=floor(sqrt(_dx*_dx+_dy*_dy+_dz*_dz)) else dist=0 end
+    local losOk=false; if bestTargetRoot then local slot=_visCache[bestTarget]; losOk=slot~=nil and slot.vis==true end
+    local vpX=vpX_ or Camera.ViewportSize.X; local hx=vpX-180; local hy=12
+    if vpX~=_lastHudVpX then
+        _lastHudVpX=vpX; _hudBg.Position=Vector2.new(hx-4,hy-4); _hudBg.Size=Vector2.new(176,76)
+        _hudName.Position=Vector2.new(hx,hy); _hudHP.Position=Vector2.new(hx,hy+18)
+        _hudDist.Position=Vector2.new(hx,hy+34); _hudLoS.Position=Vector2.new(hx,hy+50)
+    end
+    _hudBg.Visible=true
+    if pname~=_lastHudName then _lastHudName=pname; _hudName.Text="► "..pname; _hudName.Color=_C_HUD_NAME end
+    _hudName.Visible=true
+    local hpPct=floor(hp*100)
+    if hpPct~=_lastHudHPPct then
+        _lastHudHPPct=hpPct
+        local bars=floor(hp*12); _hudHPText=sfmt("HP  %d%%  [%s]",hpPct,string.rep("|",bars)..string.rep("·",12-bars)); _hudHP.Text=_hudHPText
+        local hpCol=Lib._getHP(hp); if hpCol~=_lastHudHPColor then _lastHudHPColor=hpCol; _hudHP.Color=hpCol end
+    end
+    _hudHP.Visible=true
+    if dist~=_lastHudDist then _lastHudDist=dist; _hudDistText="Dist  "..dist.." studs"; _hudDist.Text=_hudDistText end
+    _hudDist.Visible=true
+    if losOk~=_lastHudLosOk then _lastHudLosOk=losOk; _hudLoS.Text=losOk and "✓ LoS" or "✗ sem LoS"; _hudLoS.Color=losOk and _C_LOS_OK or _C_LOS_FAIL end
+    _hudLoS.Visible=true; _lastHudVisible=true
+end
+
+-- Crosshair
+local crossLines={}
+for _=1,4 do crossLines[#crossLines+1]=makeDrawing("Line",{Thickness=1}) end
+function Lib._xhair()
+    if not HAS_DRAWING then return end
+    local vp=Camera.ViewportSize; local cx=vp.X/2; local cy=vp.Y/2
+    local sz=Config.CrosshairSize; local gap=Config.CrosshairGap; local vis=Config.CrosshairEnabled
+    local col=Config.CrosshairColor; local thk=Config.CrosshairThickness
+    crossLines[1].From=Vector2.new(cx-sz,cy); crossLines[1].To=Vector2.new(cx-gap,cy)
+    crossLines[2].From=Vector2.new(cx+gap,cy); crossLines[2].To=Vector2.new(cx+sz,cy)
+    crossLines[3].From=Vector2.new(cx,cy-sz); crossLines[3].To=Vector2.new(cx,cy-gap)
+    crossLines[4].From=Vector2.new(cx,cy+gap); crossLines[4].To=Vector2.new(cx,cy+sz)
+    for _,l in ipairs(crossLines) do l.Visible=vis; l.Color=col; l.Thickness=thk end
+    _crosshairVPCache=vp
+end
+Lib._xhair()
+
+-- Off-Screen Indicator — seta apontando pro alvo fora da tela
+local _osArrow=makeDrawing("Triangle",{Filled=true,Color=Color3.fromRGB(255,80,80),Thickness=1})
+local _osArrowOutline=makeDrawing("Triangle",{Filled=false,Color=Color3.fromRGB(0,0,0),Thickness=2})
+local _lastOSVisible=false
+
+local function _updateOffScreen(camCF,vpX,vpY)
+    if not HAS_DRAWING or not Config.OffScreenEnabled or not bestTarget or not bestAimPart then
+        if _lastOSVisible then _osArrow.Visible=false; _osArrowOutline.Visible=false; _lastOSVisible=false end; return
+    end
+    local spX,spY,spZ,onScreen=getVPPoint(bestAimPart)
+    if onScreen and spZ>0 then
+        if _lastOSVisible then _osArrow.Visible=false; _osArrowOutline.Visible=false; _lastOSVisible=false end; return
+    end
+    local camPos=camCF.Position; local tarPos=bestAimPart.Position
+    local dx=tarPos.X-camPos.X; local dy=tarPos.Y-camPos.Y; local dz=tarPos.Z-camPos.Z
+    local tarWorld=Vector3.new(dx,dy,dz)
+    local right=camCF.RightVector; local up=camCF.UpVector
+    local screenX=tarWorld:Dot(right); local screenY=-tarWorld:Dot(up)
+    local mag=sqrt(screenX*screenX+screenY*screenY); if mag<0.001 then return end
+    local nx=screenX/mag; local ny=screenY/mag
+    local margin=40; local cx=vpX*0.5; local cy=vpY*0.5
+    local halfX=cx-margin; local halfY=cy-margin
+    local tx,ty
+    if abs(nx)*halfY>abs(ny)*halfX then local s=halfX/abs(nx); tx=cx+nx*s; ty=cy+ny*s
+    else local s=halfY/abs(ny); tx=cx+nx*s; ty=cy+ny*s end
+    tx=clamp(tx,margin,vpX-margin); ty=clamp(ty,margin,vpY-margin)
+    -- usar cor do ESP do alvo
+    local arrowColor=_C_LOCK_ESP  -- alvo travado usa cor de lock
+    local vcached=_visCache[bestTarget]; local isVisible=vcached and vcached.vis or false
+    if not isVisible then arrowColor=Config.ESPWallColor end
+    local sz=Config.OffScreenSize; local angle=math.atan2(ny,nx)
+    local cosA=cos(angle); local sinA=sin(angle)
+    local function rot(px,py) return tx+px*cosA-py*sinA,ty+px*sinA+py*cosA end
+    local ax,ay=rot(sz,0); local bx,by=rot(-sz*0.5,sz*0.5); local cx2,cy2=rot(-sz*0.5,-sz*0.5)
+    local va=Vector2.new(ax,ay); local vb=Vector2.new(bx,by); local vc=Vector2.new(cx2,cy2)
+    _osArrow.PointA=va; _osArrow.PointB=vb; _osArrow.PointC=vc
+    _osArrow.Color=arrowColor; _osArrow.Visible=true
+    _osArrowOutline.PointA=va; _osArrowOutline.PointB=vb; _osArrowOutline.PointC=vc; _osArrowOutline.Visible=true
+    _lastOSVisible=true
+end
+
+-- Keybind helpers
+local MOUSE_BUTTON_NAMES={[Enum.UserInputType.MouseButton1]="Mouse1 (Esq)",[Enum.UserInputType.MouseButton2]="Mouse2 (Dir)",[Enum.UserInputType.MouseButton3]="Mouse3 (Meio)"}
+function Lib._bindName(bind) if not bind then return "?" end; if bind.ktype=="mouse" then return MOUSE_BUTTON_NAMES[bind.value] or tostring(bind.value) end; return bind.value and bind.value.Name or "?" end
+function Lib._inputMatch(input,bind)
+    if not bind then return false end
+    if bind.ktype=="key" then return input.UserInputType==Enum.UserInputType.Keyboard and input.KeyCode==bind.value
+    elseif bind.ktype=="mouse" then return input.UserInputType==bind.value end; return false
+end
+function Lib._keybind(bindName,displayBtn)
+    displayBtn.Text="[ Pressione... ]"; TweenService:Create(displayBtn,TI_FAST,{BackgroundColor3=COLORS.accent}):Play()
+    local conn
+    local function _cancelCapture() if conn then conn:Disconnect(); conn=nil end; displayBtn.Text=Lib._bindName(Config.Keybinds[bindName]); TweenService:Create(displayBtn,TI_FAST,{BackgroundColor3=COLORS.bg_card}):Play() end
+    local timeoutThread=task.delay(10,function() if isRunning then _cancelCapture() end end)
+    conn=UserInputService.InputBegan:Connect(function(inp)
+        if not isRunning then pcall(task.cancel,timeoutThread); return end; pcall(task.cancel,timeoutThread)
+        if inp.UserInputType==Enum.UserInputType.Keyboard and inp.KeyCode==Enum.KeyCode.Escape then _cancelCapture(); return end
+        if inp.UserInputType==Enum.UserInputType.Keyboard then
+            Config.Keybinds[bindName]={ktype="key",value=inp.KeyCode}; displayBtn.Text=inp.KeyCode.Name
+            TweenService:Create(displayBtn,TI_FAST,{BackgroundColor3=COLORS.bg_card}):Play()
+            conn:Disconnect(); conn=nil; notify("Bind "..bindName..": "..inp.KeyCode.Name,"success"); configDirty=true; pcall(saveConfig); return
+        end
+        if MOUSE_BUTTON_NAMES[inp.UserInputType] then
+            Config.Keybinds[bindName]={ktype="mouse",value=inp.UserInputType}; local mname=MOUSE_BUTTON_NAMES[inp.UserInputType]
+            displayBtn.Text=mname; TweenService:Create(displayBtn,TI_FAST,{BackgroundColor3=COLORS.bg_card}):Play()
+            conn:Disconnect(); conn=nil; notify("Bind "..bindName..": "..mname,"success"); configDirty=true; pcall(saveConfig); return
+        end
+    end)
+end
+
+-- Tabs helpers
+local function makeSepLocal(parent,label)
+    local sep=Instance.new("Frame",parent); sep.Size=UDim2.new(1,0,0,20); sep.BackgroundTransparency=1
+    local line=Instance.new("Frame",sep); line.Size=UDim2.new(1,-16,0,1); line.Position=UDim2.new(0,8,0.5,0)
+    line.BackgroundColor3=COLORS.bg_card; line.BorderSizePixel=0
+    local lbl=Instance.new("TextLabel",sep); lbl.Size=UDim2.new(0,100,1,0); lbl.Position=UDim2.new(0.5,-50,0,0)
+    lbl.BackgroundColor3=COLORS.bg_main; lbl.BorderSizePixel=0; lbl.TextColor3=COLORS.text_sub
+    lbl.TextSize=10; lbl.Font=Enum.Font.GothamBold; lbl.Text=label; lbl.TextXAlignment=Enum.TextXAlignment.Center
+end
+local function createToggleKeybind(parent,label,configKey,bindName,callback,tooltip)
+    local bind=Config.Keybinds[bindName]; local bindLabel=bind and ("  [ "..Lib._bindName(bind).." ]") or ""
+    local row=createToggle(parent,label..bindLabel,configKey,callback,tooltip)
+    -- FIX: registrar no UIComponents para que o label atualize quando o keybind for remapeado
+    local lbl=row:FindFirstChildWhichIsA("TextLabel")
+    if lbl then
+        UIComponents["_tkb_"..configKey.."_"..bindName]={setValue=function()
+            local b=Config.Keybinds[bindName]; lbl.Text=label..(b and ("  [ "..Lib._bindName(b).." ]") or "")
+        end}
+    end
+    return row
+end
+
+-- ── COMBAT TAB ──
+makeSepLocal(CombatFrame,"── AIMBOT ──")
+createToggleKeybind(CombatFrame,"Aimbot","AimbotEnabled","AimbotKey",function(v)
+    _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot()
+    notify("Aimbot: "..(v and "ON" or "OFF"),v and "success" or "info")
+end,"Liga/desliga o aimbot principal")
+createToggle(CombatFrame,"Silent Aim","SilentAim",function(v)
+    pcall(_onSilentAimChanged,v)
+    if v then notify("⚠ SILENT AIM ATIVO — câmera NÃO se move!","warn",6) else notify("Silent Aim OFF","success",3) end
+end,"Redireciona Raycast sem mover câmera")
+createDropdown(CombatFrame,"Modo Aimbot",{"Toggle","Hold"},"AimbotMode",function(v) if v=="Toggle" then isHoldingAim=false end end)
+createSlider(CombatFrame,"FOV",10,180,"FOV",function() _lastAimFov=-1; _fovDirty_vis=nil; Lib._fovCircle() end,"Raio do círculo de busca")
+createSlider(CombatFrame,"Smooth (1=snap  20=suave)",1,20,"Smooth",function() _updateSmoothCache() end,"Suavidade — 1=trava instantâneo  20=movimento suave")
+createDropdown(CombatFrame,"Hitbox",{"Head","Chest","Auto"},"HitboxPart",nil)
+createSlider(CombatFrame,"Distância Máx",50,1000,"MaxDistance",nil)
+createSlider(CombatFrame,"Vel. Máx Angular (°/s)",1,3600,"MaxAngularSpeed",nil,"Limita velocidade de rotação da câmera")
+makeSepLocal(CombatFrame,"── SCORE ──")
+createSlider(CombatFrame,"Peso FOV",0,999,"ScoreWeightFOV",function() _updateScoreWeightCache() end,"Peso do ângulo na seleção de alvo")
+createSlider(CombatFrame,"Peso Dist",0,999,"ScoreWeightDist",function() _updateScoreWeightCache() end,"Peso da distância na seleção de alvo")
+createSlider(CombatFrame,"Peso HP",0,999,"ScoreWeightHP",function() _updateScoreWeightCache() end,"Peso do HP na seleção de alvo")
+createToggle(CombatFrame,"Team Check","TeamCheck",nil)
+createToggle(CombatFrame,"Wall Check","WallCheck",nil)
+createToggle(CombatFrame,"Lock On Visible","LockOnVisible",nil,"Mantém lock por 0.3s mesmo sem linha de visão")
+makeSepLocal(CombatFrame,"── PREDIÇÃO ──")
+createToggle(CombatFrame,"Predição","PredictionEnabled",nil,"Bullet lead iterativo (2 iterações) — compensa ping + tempo de voo")
+createToggle(CombatFrame,"Lag Comp","LagCompensation",nil)
+makeSepLocal(CombatFrame,"── SMOOTHING ──")
+createToggle(CombatFrame,"Spring Smoothing","SpringSmoothing",nil,"Suavização 2ª ordem (sem oscilação). Desative para lerp exponencial clássico")
+createSlider(CombatFrame,"Spring Damping",1,100,"SpringDamping",nil,"Amortecimento do spring (0.01=suave/lento  1.0=agressivo)")
+createToggle(CombatFrame,"Magnetismo","MagnetismEnabled",nil,"Atração suave sem travar — mais discreto que o aimbot completo")
+createSlider(CombatFrame,"Força Magnetismo",1,100,"MagnetismStrength",nil)
+makeSepLocal(CombatFrame,"── TRIGGERBOT ──")
+createToggle(CombatFrame,"Triggerbot","TriggerbotEnabled",nil)
+createSlider(CombatFrame,"Trigger Delay (cs)",1,100,"TriggerDelay",nil)
+makeSepLocal(CombatFrame,"── RECOIL ──")
+createToggle(CombatFrame,"Recoil Control (estático)","RecoilEnabled",nil,"Usa valores fixos do perfil de arma")
+makeSepLocal(CombatFrame,"── RCS DINÂMICO ──")
+createToggle(CombatFrame,"RCS Dinâmico","DynRCSEnabled",function(v)
+    if v then _rcsClearPattern(); notify("RCS Dinâmico ATIVO — atire para aprender o padrão","info",5) end
+end,"Aprende o recoil real da câmera e compensa automaticamente")
+createSlider(CombatFrame,"Intensidade RCS",1,100,"DynRCSStrength",nil,"Força da compensação (100=compensação total)")
+createSlider(CombatFrame,"Amostras do padrão",4,60,"DynRCSMaxSamples",function() _rcsClearPattern() end,"Quantos tiros memoriza antes de compensar")
+makeSepLocal(CombatFrame,"── AUTO-PEEK ──")
+createToggle(CombatFrame,"Auto-Peek","AutoPeekEnabled",function(v)
+    if not v then _peekReset() end
+    if v then notify("Auto-Peek ATIVO — tecla: "..Lib._bindName(Config.Keybinds.PeekKey),"info",4) end
+end,"Peek automático lateral, atira e retorna à posição original")
+createSlider(CombatFrame,"Distância do Peek",2,12,"AutoPeekDist",nil,"Studs para peekar lateralmente")
+createSlider(CombatFrame,"Velocidade do Peek",1,30,"AutoPeekSpeed",nil,"Studs/s do movimento")
+makeSepLocal(CombatFrame,"── HUD ──")
+createToggle(CombatFrame,"HUD do Alvo","TargetHUDEnabled",nil)
+createToggle(CombatFrame,"Crosshair","CrosshairEnabled",function() Lib._xhair() end)
+createToggle(CombatFrame,"Mostrar FOV","ShowFOV",function() _fovDirty_vis=nil; Lib._fovCircle() end,"Exibe/esconde o círculo de FOV na tela")
+makeSepLocal(CombatFrame,"── FLICK (estilo Valorant) ──")
+createToggle(CombatFrame,"Flick Mode","FlickEnabled",function(v)
+    if v then notify("⚡ FLICK — pressione FlickKey quando houver alvo no FOV","warn",5) end
+    _flickReset()
+end,"Independente do aimbot — encontra alvo, snapa, atira, volta")
+createSlider(CombatFrame,"Flick Speed (1=lento 20=snap)",1,20,"FlickSpeed",nil,"Velocidade de ida ao alvo")
+createSlider(CombatFrame,"Return Speed (1=lento 20=snap)",1,20,"FlickReturnSpeed",nil,"Velocidade de retorno à posição original")
+makeSepLocal(CombatFrame,"── OFF-SCREEN ──")
+createToggle(CombatFrame,"Off-Screen Indicator","OffScreenEnabled",nil,"Seta apontando pro alvo quando ele sai da tela")
+createSlider(CombatFrame,"Tamanho da Seta",8,28,"OffScreenSize",nil)
+
+-- ── VISUALS TAB ──
+makeSepLocal(VisualsFrame,"── ESP ──")
+createToggleKeybind(VisualsFrame,"ESP (Boxes)","ESPEnabled","ESPKey",function() Lib._statusDot() end)
+createToggle(VisualsFrame,"Head Dot","HeadDotEnabled",nil,"Pequeno círculo na cabeça — escala com distância")
+createToggle(VisualsFrame,"Tracers","TracerEnabled",nil)
+createToggle(VisualsFrame,"Skeleton","SkeletonEnabled",nil)
+createToggle(VisualsFrame,"Nomes/Distância","LabelsEnabled",nil)
+createToggle(VisualsFrame,"Arma no Label","WeaponLabelEnabled",nil,"Mostra arma equipada no label do ESP")
+createToggle(VisualsFrame,"HealthBar","HealthBarEnabled",nil)
+createToggle(VisualsFrame,"ESP p/ Whitelist","ShowWhitelistESP",nil)
+createToggle(VisualsFrame,"Cor por Time (ESP)","TeamColorESP",nil)
+createDropdown(VisualsFrame,"Tracer Origem",{"Bottom","Center","Crosshair"},"TracerOrigin",nil)
+makeSepLocal(VisualsFrame,"── CHAMS ──")
+createToggle(VisualsFrame,"Chams","ChamEnabled",nil)
+createToggle(VisualsFrame,"Chams cor HP","ChamHPColor",nil)
+makeSepLocal(VisualsFrame,"── CORES ──")
+createColorPicker(VisualsFrame,"Cor Box ESP","ESPColor",nil)
+createColorPicker(VisualsFrame,"Cor Box (Parede)","ESPWallColor",nil)
+createColorPicker(VisualsFrame,"Cor Tracers","TracerColor",nil)
+createColorPicker(VisualsFrame,"Cham Fill","ChamFillColor",nil)
+createColorPicker(VisualsFrame,"Cham Outline","ChamOutlineColor",nil)
+
+makeSepLocal(VisualsFrame,"── PERFIS DE ARMA ──")
+do
+    local profileNames={}; for k in pairs(Config.WeaponProfiles) do profileNames[#profileNames+1]=k end; table.sort(profileNames)
+    local selectedProfile=profileNames[1] or "Sniper"
+    local _wpDropRow=Instance.new("Frame",VisualsFrame); _wpDropRow.Size=UDim2.new(1,0,0,36); _wpDropRow.BackgroundTransparency=1
+    local _wpLabel=Instance.new("TextLabel",_wpDropRow); _wpLabel.Size=UDim2.new(0.45,0,1,0); _wpLabel.BackgroundTransparency=1
+    _wpLabel.TextColor3=COLORS.text_sub; _wpLabel.TextSize=12; _wpLabel.Font=Enum.Font.Gotham; _wpLabel.Text="Perfil"; _wpLabel.TextXAlignment=Enum.TextXAlignment.Left; _wpLabel.Position=UDim2.new(0,10,0,0)
+    local _btnW=Instance.new("TextButton",_wpDropRow); _btnW.Size=UDim2.new(0,22,0,22); _btnW.Position=UDim2.new(0.5,0,0.5,-11)
+    _btnW.BackgroundColor3=COLORS.bg_card; _btnW.TextColor3=COLORS.text_main; _btnW.TextSize=12; _btnW.Font=Enum.Font.GothamBold; _btnW.Text="<"; _btnW.BorderSizePixel=0
+    Instance.new("UICorner",_btnW).CornerRadius=UDim.new(0,4)
+    local _wpNameLbl=Instance.new("TextLabel",_wpDropRow); _wpNameLbl.Size=UDim2.new(0,80,0,22); _wpNameLbl.Position=UDim2.new(0.5,24,0.5,-11)
+    _wpNameLbl.BackgroundTransparency=1; _wpNameLbl.TextColor3=COLORS.text_main; _wpNameLbl.TextSize=12; _wpNameLbl.Font=Enum.Font.GothamMedium; _wpNameLbl.Text=selectedProfile
+    local _btnE=Instance.new("TextButton",_wpDropRow); _btnE.Size=UDim2.new(0,22,0,22); _btnE.Position=UDim2.new(0.5,106,0.5,-11)
+    _btnE.BackgroundColor3=COLORS.bg_card; _btnE.TextColor3=COLORS.text_main; _btnE.TextSize=12; _btnE.Font=Enum.Font.GothamBold; _btnE.Text=">"; _btnE.BorderSizePixel=0
+    Instance.new("UICorner",_btnE).CornerRadius=UDim.new(0,4)
+    local function cycleProfile(dir) local idx=1; for i,n in ipairs(profileNames) do if n==selectedProfile then idx=i; break end end; idx=((idx-1+dir)%#profileNames)+1; selectedProfile=profileNames[idx]; _wpNameLbl.Text=selectedProfile end
+    _btnW.MouseButton1Click:Connect(function() cycleProfile(-1) end); _btnE.MouseButton1Click:Connect(function() cycleProfile(1) end)
+    createSlider(VisualsFrame,"  FOV do Perfil",10,180,nil,function(v) local p=Config.WeaponProfiles[selectedProfile]; if p then p.FOV=v end end)
+    createSlider(VisualsFrame,"  Smooth do Perfil",1,20,nil,function(v) local p=Config.WeaponProfiles[selectedProfile]; if p then p.Smooth=v end end)
+    createSlider(VisualsFrame,"  Bullet Speed",0,9999,nil,function(v) local p=Config.WeaponProfiles[selectedProfile]; if p then p.BulletSpeed=v end end)
+end
+
+switchTab("Combat")
+
+local _ddCloseConn=UserInputService.InputBegan:Connect(function(inp,gp)
+    if gp then return end
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then for _,entry in ipairs(_openDropdownLists) do entry.Visible=false end end
+end)
+Lib.Connections[#Lib.Connections+1]=_ddCloseConn
+
+-- ── PLAYERS TAB ──
+local PlayerEntries={}
+local function getStatusColor(player)
+    local uid=player.UserId
+    if Config.AdminIDs[uid] then return COLORS.red end
+    if Config.Whitelist[uid] then return COLORS.green end
+    if Config.PriorityList[uid] then return COLORS.red end
+    return COLORS.text_sub
+end
+
+function Lib._playerEntry(player)
+    if player==LocalPlayer then return end; if PlayerEntries[player.UserId] then return end
+    local entry=Instance.new("Frame",PlayersFrame); entry.Size=UDim2.new(1,-8,0,50); entry.BackgroundColor3=COLORS.bg_card; entry.BorderSizePixel=0
+    Instance.new("UICorner",entry).CornerRadius=UDim.new(0,6)
+    local bar=Instance.new("Frame",entry); bar.Size=UDim2.new(0,3,0.7,0); bar.Position=UDim2.new(0,6,0.15,0)
+    bar.BackgroundColor3=getStatusColor(player); bar.BorderSizePixel=0; Instance.new("UICorner",bar).CornerRadius=UDim.new(1,0)
+    local nameL=Instance.new("TextLabel",entry); nameL.Size=UDim2.new(0,160,0,22); nameL.Position=UDim2.new(0,18,0,4)
+    nameL.BackgroundTransparency=1; nameL.TextColor3=COLORS.text_main; nameL.TextSize=13; nameL.Font=Enum.Font.GothamMedium
+    nameL.Text=player.DisplayName; nameL.TextXAlignment=Enum.TextXAlignment.Left; nameL.TextTruncate=Enum.TextTruncate.AtEnd
+    local idL=Instance.new("TextLabel",entry); idL.Size=UDim2.new(0,160,0,16); idL.Position=UDim2.new(0,18,0,27)
+    idL.BackgroundTransparency=1; idL.TextColor3=COLORS.text_sub; idL.TextSize=11; idL.Font=Enum.Font.Code; idL.Text=tostring(player.UserId); idL.TextXAlignment=Enum.TextXAlignment.Left
+    local function makeBtn(txt,col,xOff) local b=Instance.new("TextButton",entry); b.Size=UDim2.new(0,32,0,22); b.Position=UDim2.new(1,xOff,0.5,-11); b.BackgroundColor3=col; b.TextColor3=_C_WHITE; b.TextSize=11; b.Font=Enum.Font.GothamBold; b.Text=txt; b.BorderSizePixel=0; Instance.new("UICorner",b).CornerRadius=UDim.new(0,4); return b end
+    local wlBtn=makeBtn("WL",COLORS.green,-74); local plBtn=makeBtn("PR★",COLORS.red,-36)
+    local function refreshBar() TweenService:Create(bar,TI_FAST,{BackgroundColor3=getStatusColor(player)}):Play() end
+    wlBtn.MouseButton1Click:Connect(function()
+        local uid=player.UserId; if Config.Whitelist[uid] then Config.Whitelist[uid]=nil; notify(player.DisplayName.." saiu da WL","info")
+        else Config.Whitelist[uid]=true; Config.PriorityList[uid]=nil; notify(player.DisplayName.." → WL","success") end
+        configDirty=true; refreshBar()
+    end)
+    plBtn.MouseButton1Click:Connect(function()
+        local uid=player.UserId; if Config.PriorityList[uid] then Config.PriorityList[uid]=nil; notify(player.DisplayName.." saiu da PL","info")
+        else Config.PriorityList[uid]=true; Config.Whitelist[uid]=nil; notify(player.DisplayName.." → PL (Prioridade)","warn") end
+        configDirty=true; refreshBar()
+    end)
+    PlayerEntries[player.UserId]=entry
+    local function _onCharAdded(char)
+        local oldChar=_playerVehicleChar[player]
+        if oldChar and oldChar~=char then local oldConns=_inVehicleEventConns[oldChar]; if oldConns then pcall(function() oldConns[1]:Disconnect() end); pcall(function() oldConns[2]:Disconnect() end); _inVehicleEventConns[oldChar]=nil end; _playerVehicleChar[player]=nil end
+        _charToPlayer[char]=player
+        if oldChar then _visCache[oldChar]=nil; _boneCache[oldChar]=nil; _charCache[oldChar]=nil; _inVehicleCache[oldChar]=nil end
+        _wallFilterDirty=true; _weaponCache[player]=nil
+        -- armazenar conexões de arma para cleanup correto no unload/playerremove
+        local wConnAdd=char.ChildAdded:Connect(function(c) if c:IsA("Tool") then _weaponCache[player]=c.Name:sub(1,10) end end)
+        local wConnRem=char.ChildRemoved:Connect(function(c) if c:IsA("Tool") then _weaponCache[player]="" end end)
+        local prevWConns=_inVehicleEventConns["_wc_"..tostring(player.UserId)]
+        if prevWConns then pcall(function() prevWConns[1]:Disconnect() end); pcall(function() prevWConns[2]:Disconnect() end) end
+        _inVehicleEventConns["_wc_"..tostring(player.UserId)]={wConnAdd,wConnRem}
+        task.defer(function() if not isRunning then return end; Lib._connectDied(char,player) end)
+    end
+    local charAddedConn=player.CharacterAdded:Connect(_onCharAdded)
+    Lib.Connections["charAdded_"..player.UserId]=charAddedConn
+    if player.Character then _charToPlayer[player.Character]=player; Lib._connectDied(player.Character,player) end
+end
+
+local function removePlayerEntry(player)
+    local connKey="charAdded_"..player.UserId; local conn=Lib.Connections[connKey]
+    if conn then pcall(function() conn:Disconnect() end); Lib.Connections[connKey]=nil end
+    local e=PlayerEntries[player.UserId]; if not e then return end
+    TweenService:Create(e,TI_MED,{Size=UDim2.new(1,-8,0,0),BackgroundTransparency=1}):Play()
+    task.delay(0.25,function() if e and e.Parent then e:Destroy() end end)
+    PlayerEntries[player.UserId]=nil
+end
+
+Lib.Connections.PAAdd=Players.PlayerAdded:Connect(function(p) _playerListAdd(p); Lib._playerEntry(p) end)
+Lib.Connections.PARemove=Players.PlayerRemoving:Connect(function(p) _playerListRemove(p); removePlayerEntry(p) end)
+Lib.Connections.PACacheClean=Players.PlayerRemoving:Connect(function(p)
+    _stateSlot[p.UserId]=nil; _chamHPCache[p]=nil; _labelPosCache[p]=nil; _skelColorCache[p]=nil
+    local char=p.Character; if char then clearPlayerESP(p,char) end
+end)
+
+end)()
+
+-- ================================================================
+-- 5. AIMBOT COMPLETO
+-- ================================================================
+;(function()
+
+local _onSilentAimChanged
+
+-- ===== DETECÇÃO DE ESTRATÉGIA DE AIMBOT =====
+local _detectedStrategy = "CAMERA_CFRAME"  -- "CAMERA_CFRAME" | "SILENT_ONLY"
+local _strategyTestedAt = 0
+
+local function _detectAimbotStrategy()
+    local now = tick()
+    if now - _strategyTestedAt < 30 then return end  -- Cache por 30s
+    
+    _strategyTestedAt = now
+    
+    local origCFrame = Camera.CFrame
+    local testResult = "CAMERA_CFRAME"
+    
+    local ok = pcall(function()
+        local testAngle = math.rad(0.1)
+        Camera.CFrame = origCFrame * CFrame.Angles(testAngle, 0, 0)
+        task.wait(0.008)
+        
+        local newCFrame = Camera.CFrame
+        local rotated = (newCFrame - origCFrame).Magnitude > 0.001
+        
+        if not rotated then
+            testResult = "SILENT_ONLY"
+        end
+        
+        Camera.CFrame = origCFrame
+    end)
+    
+    if not ok then testResult = "SILENT_ONLY" end
+    
+    _detectedStrategy = testResult
+end
+
+-- ===== SUSPICION TRACKING =====
+local _suspicionLevel = 0
+local _lastHeadshotTime = 0
+local _headshotCount = 0
+local _aimbotActiveTime = 0
+
+local function _updateSuspicion(dt)
+    -- Decair suspição com o tempo
+    _suspicionLevel = max(_suspicionLevel - dt * 0.05, 0)
+    
+    if not Config.AimbotEnabled then
+        _aimbotActiveTime = 0
+        return
+    end
+    
+    _aimbotActiveTime = _aimbotActiveTime + dt
+    
+    -- Penalidade: Aimbot ativo por muito tempo
+    if _aimbotActiveTime > 180 then  -- 3 minutos
+        _suspicionLevel = _suspicionLevel + dt * 0.1
+    end
+    
+    -- Penalidade: Muitos headshots em curto período
+    if tick() - _lastHeadshotTime < 2 and _headshotCount >= 5 then
+        _suspicionLevel = _suspicionLevel + dt * 0.2
+    end
+    
+    -- Se suspición atingir limiar crítico
+    if _suspicionLevel > 0.85 then
+        Config.AimbotEnabled = false
+        notify("🚨 RISCO CRÍTICO! Aimbot desativado por 45s", "error")
+        _suspicionLevel = 0
+        _aimbotActiveTime = 0
+        
+        task.delay(45, function()
+            if isRunning then
+                Config.AimbotEnabled = true
+                notify("✓ Aimbot retomado", "success", 2)
+            end
+        end)
+    end
+end
+
+local _cachedPing=0; local _lastPingTime=0; local _PING_TTL=0.2
+function _getCachedPing()
+    local now=_frameTick; if now-_lastPingTime>_PING_TTL then _lastPingTime=now; _cachedPing=clamp(LocalPlayer:GetNetworkPing(),0,0.25) end; return _cachedPing
+end
+
+local function _computeInVehicle(root,char)
+    if not root:FindFirstChildOfClass("Weld") and not root:FindFirstChildOfClass("WeldConstraint") then return false end
+    for _,j in ipairs(root:GetChildren()) do
+        if j:IsA("Weld") or j:IsA("WeldConstraint") then
+            local p0=j.Part0; local p1=j.Part1; local other=(p0==root) and p1 or p0
+            if other and not char:IsAncestorOf(other) then return true end
+        end
+    end; return false
+end
+local function _hookVehicleEvents(char,root)
+    local old=_inVehicleEventConns[char]; if old then pcall(function() old[1]:Disconnect() end); pcall(function() old[2]:Disconnect() end) end
+    local function invalidate() _inVehicleCache[char]=nil end
+    _inVehicleEventConns[char]={root.ChildAdded:Connect(invalidate),root.ChildRemoved:Connect(invalidate)}
+    local player=_charToPlayer[char]; if player then _playerVehicleChar[player]=char end
+end
+local function isInVehicle(char)
+    local cached=_inVehicleCache[char]; if cached~=nil then return cached end
+    local root=char:FindFirstChild("HumanoidRootPart"); if not root then _inVehicleCache[char]=false; return false end
+    local result=_computeInVehicle(root,char); _inVehicleCache[char]=result; _hookVehicleEvents(char,root); return result
+end
+
+-- ===== PERFORMANCE MONITOR =====
+local _perfStats = {
+    frameTime = 0,
+    avgFPS = 0,
+    lastFrameTimes = {},
+    aimUpdatesPerFrame = 0,
+    raycastsPerFrame = 0,
+    drawingsActive = 0
+}
+
+local function _recordPerfStats()
+    -- Média de FPS nos últimos 30 frames
+    table.insert(_perfStats.lastFrameTimes, 1, _frameCount % 30)
+    if #_perfStats.lastFrameTimes > 30 then
+        _perfStats.lastFrameTimes[#_perfStats.lastFrameTimes] = nil
+    end
+    
+    local totalTime = 0
+    for _, ft in ipairs(_perfStats.lastFrameTimes) do
+        totalTime = totalTime + ft
+    end
+    
+    if #_perfStats.lastFrameTimes > 0 then
+        _perfStats.frameTime = totalTime / #_perfStats.lastFrameTimes
+        _perfStats.avgFPS = 1 / max(_perfStats.frameTime, 0.001)
+    end
+end
+
+-- Debugging: monitorar performance
+local _debugMode = false  -- set para true para ativar logs
+local function _debugLog(msg)
+    if _debugMode then
+        print("[PHANTOM DEBUG] " .. msg)
+    end
+end
+
+local floorParams=RaycastParams.new(); floorParams.FilterType=Enum.RaycastFilterType.Exclude
+local _floorFilter={workspace.Terrain}; local _floorLastChar=nil
+local _fallbackFloorParams=RaycastParams.new(); _fallbackFloorParams.FilterType=Enum.RaycastFilterType.Exclude
+local _fallbackFloorFilter={workspace.Terrain}
+
+local function _getOrCreateStateSlot(uid)
+    local s=_stateSlot[uid]
+    if not s then s={state={speed=0,isMoving=false,isCrouched=false,isAirborne=false,velocity=Vector3.zero,inVehicle=false},rootPos=Vector3.zero,t=0,uidMod=uid%3}; _stateSlot[uid]=s end
+    return s
+end
+local _fallbackStateSlot={speed=0,isMoving=false,isCrouched=false,isAirborne=false,velocity=Vector3.zero,inVehicle=false}
+local function _computeFallbackState(char,root)
+    local vel=root.AssemblyLinearVelocity; local vx,vz=vel.X,vel.Z; local hVelMag=sqrt(vx*vx+vz*vz)
+    _fallbackFloorFilter[1]=char; _fallbackFloorParams.FilterDescendantsInstances=_fallbackFloorFilter
+    local rootPos=root.Position; local floorHit=workspace:Raycast(rootPos,FLOOR_RAY_DIR,_fallbackFloorParams)
+    local heightAbove=floorHit and (rootPos.Y-floorHit.Position.Y) or 999
+    -- FIX: reutilizar tabela estática em vez de alocar nova a cada call
+    _fallbackStateSlot.speed=hVelMag; _fallbackStateSlot.isMoving=hVelMag>2
+    _fallbackStateSlot.isCrouched=heightAbove<2.0; _fallbackStateSlot.isAirborne=floorHit==nil
+    _fallbackStateSlot.velocity=vel; _fallbackStateSlot.inVehicle=false
+    return _fallbackStateSlot
+end
+local _nullState={speed=0,isMoving=false,isCrouched=false,isAirborne=false,velocity=Vector3.zero,inVehicle=false}
+function Lib._getState(char,root,uid)
+    if not root or not root.Parent then return _nullState end
+    if uid then
+        local slot=_getOrCreateStateSlot(uid); local now=_frameTick; local rp=root.Position; local srp=slot.rootPos
+        local ddx=srp.X-rp.X; local ddy=srp.Y-rp.Y; local ddz=srp.Z-rp.Z
+        if (now-slot.t)<STATE_CACHE_TTL and (ddx*ddx+ddy*ddy+ddz*ddz)<1.0 then return slot.state end
+        local vel=root.AssemblyLinearVelocity; local st=slot.state
+        if isInVehicle(char) then local vMag=vel.Magnitude; st.speed=vMag; st.isMoving=vMag>2; st.isCrouched=false; st.isAirborne=false; st.velocity=vel; st.inVehicle=true
+        else
+            local vx,vz=vel.X,vel.Z; local hVelMag=sqrt(vx*vx+vz*vz)
+            if _floorLastChar~=char then _floorLastChar=char; _floorFilter[1]=char; floorParams.FilterDescendantsInstances=_floorFilter end
+            local rootPos=root.Position; local floorHit=workspace:Raycast(rootPos,FLOOR_RAY_DIR,floorParams)
+            local heightAbove=floorHit and (rootPos.Y-floorHit.Position.Y) or 999
+            st.speed=hVelMag; st.isMoving=hVelMag>2; st.isCrouched=heightAbove<2.0; st.isAirborne=floorHit==nil; st.velocity=vel; st.inVehicle=false; slot.rootPos=rootPos
+        end
+        slot.t=now; return st
+    end
+    return _computeFallbackState(char,root)
+end
+
+local wallParams=RaycastParams.new(); wallParams.FilterType=Enum.RaycastFilterType.Exclude
+local function _isTransparentPart(obj) return obj:IsA("BasePart") and obj.Transparency>0.5 end
+for _,obj in ipairs(workspace:GetDescendants()) do if _isTransparentPart(obj) and not _transparentSet[obj] then _transparentSet[obj]=true; transparentParts[#transparentParts+1]=obj end end
+Lib.Connections.TpAdd=workspace.DescendantAdded:Connect(function(obj) if _isTransparentPart(obj) and not _transparentSet[obj] then _transparentSet[obj]=true; transparentParts[#transparentParts+1]=obj; _wallFilterDirty=true end end)
+Lib.Connections.TpRemove=workspace.DescendantRemoving:Connect(function(obj)
+    if obj:IsA("BasePart") and _transparentSet[obj] then _transparentSet[obj]=nil
+        local tp=transparentParts; for i=#tp,1,-1 do if tp[i]==obj then tp[i]=tp[#tp]; tp[#tp]=nil; _wallFilterDirty=true; break end end
+    end
+end)
+
+local function _rebuildWallFilterBase()
+    -- FIX: reescrever sem off-by-one — slot[1] reservado para localChar/Terrain
+    local n=1  -- slot 1 reservado para localChar
+    local validCount=0
+    for i=1,#transparentParts do
+        local p=transparentParts[i]; if p and p.Parent~=nil then
+            n=n+1; _wallFilter[n]=p; validCount=validCount+1
+        end
+    end
+    -- compactar transparentParts em paralelo
+    for i=1,validCount do transparentParts[i]=_wallFilter[i+1] end
+    for i=validCount+1,#transparentParts do transparentParts[i]=nil end
+    local localChar=LocalPlayer.Character
+    if localChar then n=n+1; _wallFilter[n]=localChar end
+    for i=n+1,#_wallFilter do _wallFilter[i]=nil end
+    _wallFilter[1]=localChar or workspace.Terrain; _wallFilterDirty=false
+end
+
+local _visCheckParts={false,false,false,false,false}; local _visLastChar=nil
+local function _getOrCreateVisSlot(char) local s=_visCache[char]; if not s then s={vis=false,visPart=false,t=0}; _visCache[char]=s end; return s end
+
+local _visFilterWithChar={}  -- filter temporário incluindo char alvo
+function Lib._isVisible(char,forAimbot,camCF_)
+    local ttl=forAimbot and VIS_CACHE_TTL_AIM or VIS_CACHE_TTL_ESP; local now=_frameTick
+    local slot=_getOrCreateVisSlot(char); if (now-slot.t)<ttl then return slot.vis,slot.visPart end
+    if _wallFilterDirty then _rebuildWallFilterBase() end
+    local useCF=camCF_ or Camera.CFrame; local origin=useCF.Position; local cc=_getCharCache(char)
+    local camLook=useCF.LookVector; local camLookX,camLookY,camLookZ=camLook.X,camLook.Y,camLook.Z
+    -- FIX: incluir char alvo no filter sem sobrescrever localChar no slot[1]
+    if _visLastChar~=char then
+        _visLastChar=char
+        local n=#_wallFilter
+        for i=1,n do _visFilterWithChar[i]=_wallFilter[i] end
+        _visFilterWithChar[n+1]=char
+        for i=n+2,#_visFilterWithChar do _visFilterWithChar[i]=nil end
+        wallParams.FilterDescendantsInstances=_visFilterWithChar
+    end
+    _visCheckParts[1]=cc.head; _visCheckParts[2]=cc.torso; _visCheckParts[3]=cc.root; _visCheckParts[4]=cc.lShoulder; _visCheckParts[5]=cc.rShoulder
+    local ox,oy,oz=origin.X,origin.Y,origin.Z
+    for i=1,5 do
+        local part=_visCheckParts[i]; if part and part.Parent then
+            local px=part.Position.X-ox; local py=part.Position.Y-oy; local pz=part.Position.Z-oz
+            if (px*camLookX+py*camLookY+pz*camLookZ)>0 then
+                local dir=Vector3.new(px,py,pz)
+                if workspace:Raycast(origin,dir,wallParams)==nil then slot.vis=true; slot.visPart=part; slot.t=now; return true,part end
+            end
+        end
+    end
+    slot.vis=false; slot.visPart=nil; slot.t=now; return false,nil
+end
+
+local origRaycast=workspace.Raycast; local _saActive=false
+function Lib._enableSA()
+    if _saActive then return end; if workspace.Raycast~=origRaycast then origRaycast=workspace.Raycast end
+    local ok=pcall(function()
+        workspace.Raycast=function(ws,origin,direction,params)
+            -- DUPLA VALIDAÇÃO: bestAimPart + Parent.Parent check + magnitude safeguard
+            if Config.SilentAim and bestAimPart and bestAimPart.Parent and bestAimPart.Parent.Parent then
+                local aimPos = bestAimPart.Position
+                local dx = aimPos.X - origin.X
+                local dy = aimPos.Y - origin.Y
+                local dz = aimPos.Z - origin.Z
+                
+                -- Magnitude check para evitar overflow
+                local mag2 = dx*dx + dy*dy + dz*dz
+                if mag2 > 0.01 and mag2 < 2000000 then  -- Entre 0.1 e 1414 studs
+                    local silentDir = Vector3.new(dx, dy, dz)
+                    local ok2, result = pcall(origRaycast, ws, origin, silentDir, params)
+                    if ok2 then return result end
+                end
+            end
+            
+            local ok2, result = pcall(origRaycast, ws, origin, direction, params)
+            return ok2 and result or nil
+        end
+    end)
+    if not ok then prevSilent=false; Config.SilentAim=false; local comp=UIComponents["SilentAim"]; if comp and comp.setValue then comp.setValue(false) end; notify("Silent Aim: executor não suporta patch de Raycast","error") else _saActive=true end
+end
+function Lib._disableSA() if not _saActive then return end; pcall(function() workspace.Raycast=origRaycast end); _saActive=false end
+
+_onSilentAimChanged=function(v) prevSilent=v; if v then Lib._enableSA() else Lib._disableSA() end end
+
+local _fovColors={locked=Color3.fromRGB(220,60,60),tracked=Color3.fromRGB(220,180,40),idle=_C_WHITE}
+local function _getHitboxPart(char,cc)
+    local hp=Config.HitboxPart
+    if hp=="Head" then return cc.head or cc.root elseif hp=="Chest" then return cc.torso or cc.root
+    else local head=cc.head; if head then local vcached=_visCache[char]; if vcached and vcached.vis and vcached.visPart==head then return head end end; return cc.torso or cc.root end
+end
+
+local function getFinalAimPosition(aimPart,state,camPos)
+    if not aimPart or not aimPart.Parent then return nil end
+    local base=aimPart.Position; local dx=base.X-camPos.X; local dy=base.Y-camPos.Y; local dz=base.Z-camPos.Z
+    local dist2=dx*dx+dy*dy+dz*dz; if dist2<MIN_TARGET_DIST2 then return nil end
+    if Config.PredictionEnabled and state and state.isMoving then
+        local vel=state.velocity; local vx,vy,vz=vel.X,vel.Y,vel.Z; local vMag2=vx*vx+vy*vy+vz*vz
+        if vMag2>1 then
+            local ping=Config.LagCompensation and _getCachedPing() or 0; local dist=sqrt(dist2)
+            local bulletTime=(Config.BulletSpeed>0) and (dist/Config.BulletSpeed) or 0; local tPred=ping+bulletTime+0.016
+            
+            -- Predição adaptativa: 1 iteração para alvos rápidos, 2 para lentos
+            local maxIterations = (vMag2 > 400) and 1 or 2
+            
+            for _=1,maxIterations do
+                local ox,oy,oz=vx*tPred,vy*tPred,vz*tPred; local maxPred=state.speed*tPred*MAX_PREDICTION_VEL
+                local omag2=ox*ox+oy*oy+oz*oz; if omag2>maxPred*maxPred then local s=maxPred/sqrt(omag2); ox=ox*s; oy=oy*s; oz=oz*s end
+                if not state.isAirborne or state.inVehicle then oy=0 end
+                local predX=base.X+ox; local predY=base.Y+oy; local predZ=base.Z+oz
+                local ndx=predX-camPos.X; local ndy=predY-camPos.Y; local ndz=predZ-camPos.Z; local newDist=sqrt(ndx*ndx+ndy*ndy+ndz*ndz)
+                bulletTime=(Config.BulletSpeed>0) and (newDist/Config.BulletSpeed) or 0; tPred=ping+bulletTime+0.016
+            end
+            local ox,oy,oz=vx*tPred,vy*tPred,vz*tPred; local maxPred=state.speed*tPred*MAX_PREDICTION_VEL
+            local omag2=ox*ox+oy*oy+oz*oz; if omag2>maxPred*maxPred then local s=maxPred/sqrt(omag2); ox=ox*s; oy=oy*s; oz=oz*s end
+            if not state.isAirborne or state.inVehicle then oy=0 end; base=Vector3.new(base.X+ox,base.Y+oy,base.Z+oz)
+        end
+    end; return base
+end
+
+-- ================================================================
+-- FLICK SYSTEM (estilo Valorant)
+-- Completamente independente do aimbot
+-- Ativado pela FlickKey (padrão Mouse1)
+-- Sequência: encontra alvo → snapa câmera → dispara imediatamente → retorna suave
+-- ================================================================
+-- FLICK: variáveis de estado (declaradas como upvalues no topo do script)
+local _flickOriginLook=nil
+local _flickOriginUp=nil
+local _flickTargetLook=nil
+local _flickSnapProg=0
+local _flickRetProg=0
+local _flickFired=false
+
+_flickReset=function()
+    _flickState="idle"
+    _flickOriginLook=nil; _flickOriginUp=nil; _flickTargetLook=nil
+    _flickSnapProg=0; _flickRetProg=0; _flickFired=false
+end
+
+-- Encontra o melhor alvo independentemente do aimbot estar ligado
+local function _flickFindTarget(camCF,vpX,vpY)
+    local vp=Camera.ViewportSize
+    local vpHalfX=vp.X*0.5; local vpHalfY=vp.Y*0.5
+    local camPos=camCF.Position
+    -- calcular fovR para busca do flick (usa FOV configurado)
+    local fovR=tan(rad(min(Config.FOV,179.9)*0.5))/_tanHalfCamFOV*vpHalfY
+    local fovR2=fovR*fovR
+    local aspectRatio=vpX/vpY
+    local maxDist2=Config.MaxDistance*Config.MaxDistance
+    local bestScore=math.huge; local bPart,bState=nil,nil
+    local players,n=getPlayerSnapshot()
+    for i=1,n do
+        local player=players[i]
+        if not player or player==false or not player.Parent then continue end
+        if Config.Whitelist[player.UserId] then continue end
+        local char=player.Character; if not char then continue end
+        local cc=_getCharCache(char); local hum=cc and cc.hum
+        if not hum or hum.Health<=0 then continue end
+        if Config.TeamCheck and player.Team==LocalPlayer.Team then continue end
+        local root=cc.root; if not root then continue end
+        local rp=root.Position
+        local dx=camPos.X-rp.X; local dy=camPos.Y-rp.Y; local dz=camPos.Z-rp.Z
+        local dist2=dx*dx+dy*dy+dz*dz
+        if dist2>maxDist2 then continue end
+        local aimPart=_getHitboxPart(char,cc); if not aimPart then continue end
+        local spX,spY,spZ,onSc=getVPPoint(aimPart)
+        if not onSc or spZ<=0 then continue end
+        local ddx=(spX-vpHalfX)/aspectRatio; local ddy=spY-vpHalfY
+        local d2d2=ddx*ddx+ddy*ddy
+        if d2d2>fovR2 then continue end
+        -- score = distância angular ao centro (menor = melhor)
+        if d2d2<bestScore then bestScore=d2d2; bPart=aimPart; bState=Lib._getState(char,root,player.UserId) end
+    end
+    return bPart,bState
+end
+
+-- Ativado pela FlickKey
+_flickStart=function(camCF,vpX,vpY)
+    if _flickState~="idle" then return end
+    if not isCameraModifiable() then return end
+    local aimPart,state=_flickFindTarget(camCF,vpX,vpY)
+    if not aimPart then return end  -- sem alvo no FOV, não faz nada
+    local aimPos=getFinalAimPosition(aimPart,state,camCF.Position)
+    if not aimPos then return end
+    local origin=camCF.Position
+    local dx=aimPos.X-origin.X; local dy=aimPos.Y-origin.Y; local dz=aimPos.Z-origin.Z
+    local dmag=sqrt(dx*dx+dy*dy+dz*dz)
+    if dmag<0.01 then return end
+    _flickOriginLook=camCF.LookVector
+    _flickOriginUp=camCF.UpVector
+    _flickTargetLook=Vector3.new(dx/dmag,dy/dmag,dz/dmag)
+    _flickSnapProg=0; _flickRetProg=0; _flickFired=false
+    _flickState="snapping"
+end
+
+local function _flickApplyLook(origin,look,upVec)
+    local dot=look:Dot(upVec)
+    if dot>0.9999 or dot<-0.9999 then Camera.CFrame=CFrame.lookAt(origin,origin+look)
+    else Camera.CFrame=CFrame.lookAt(origin,origin+look,upVec) end
+end
+
+_flickTick=function(dt,camCF)
+    if not Config.FlickEnabled then _flickReset(); return end
+    if _flickState=="idle" then return end
+
+    local origin=camCF.Position
+
+    if _flickState=="snapping" then
+        -- Snap rápido ao alvo com ease-out exponencial
+        -- FlickSpeed 1=0.8s para snap, 20=0.04s (quase instantâneo)
+        local speed=clamp(Config.FlickSpeed*0.15,0.12,3.0)*60  -- frames independente
+        _flickSnapProg=min(_flickSnapProg+dt*speed,1)
+        -- ease-out: rápido no começo, cola preciso no alvo no final
+        local t=1-(1-_flickSnapProg)^3  -- cubic ease-out
+        local ol=_flickOriginLook; local tl=_flickTargetLook
+        local lx=ol.X+(tl.X-ol.X)*t; local ly=ol.Y+(tl.Y-ol.Y)*t; local lz=ol.Z+(tl.Z-ol.Z)*t
+        local lmag=sqrt(lx*lx+ly*ly+lz*lz)
+        if lmag>1e-6 then
+            _flickApplyLook(origin,Vector3.new(lx/lmag,ly/lmag,lz/lmag),_flickOriginUp or camCF.UpVector)
+        end
+        -- disparar no momento exato em que chegou ao alvo
+        if _flickSnapProg>=1 and not _flickFired then
+            _flickFired=true
+            -- Desativar Silent Aim durante flick para evitar conflito
+            local wasSilentAim = Config.SilentAim
+            if wasSilentAim then Lib._disableSA(); Config.SilentAim = false end
+            if HAS_MOUSE1CLICK then pcall(mouse1click) end
+            if wasSilentAim then Config.SilentAim = true; Lib._enableSA() end
+            _flickState="returning"; _flickRetProg=0
+        end
+        return
+    end
+
+    if _flickState=="returning" then
+        -- Retorno com smoothstep — suave nos dois extremos
+        local retSpeed=clamp(Config.FlickReturnSpeed*0.15,0.12,3.0)*60
+        _flickRetProg=min(_flickRetProg+dt*retSpeed,1)
+        local t=_flickRetProg*_flickRetProg*(3-2*_flickRetProg)  -- smoothstep
+        local ol=_flickOriginLook; local cur=camCF.LookVector
+        if ol then
+            local lx=cur.X+(ol.X-cur.X)*t; local ly=cur.Y+(ol.Y-cur.Y)*t; local lz=cur.Z+(ol.Z-cur.Z)*t
+            local lmag=sqrt(lx*lx+ly*ly+lz*lz)
+            if lmag>1e-6 then
+                _flickApplyLook(origin,Vector3.new(lx/lmag,ly/lmag,lz/lmag),_flickOriginUp or camCF.UpVector)
+            end
+        end
+        if _flickRetProg>=1 then _flickReset() end
+        return
+    end
+end
+
+local _springVelX=0; local _springVelY=0; local _springVelZ=0
+local function applyAim(aimPos,dt,camCF)
+    if not _camOkThisFrame then return end
+    local camPos_=camCF.Position; local tx=aimPos.X-camPos_.X; local ty=aimPos.Y-camPos_.Y; local tz=aimPos.Z-camPos_.Z
+    if tx*tx+ty*ty+tz*tz<MIN_TARGET_DIST2 then return end
+    local curLook=camCF.LookVector; local invTarMag=1/sqrt(tx*tx+ty*ty+tz*tz)
+    local tarX=tx*invTarMag; local tarY=ty*invTarMag; local tarZ=tz*invTarMag
+    local lx,ly,lz
+    if Config.SpringSmoothing then
+        -- Forçar damping mínimo para estabilidade
+        local damping = max(Config.SpringDamping * 0.01, 0.7)
+        local omega = _cachedSmoothSpeed * damping
+        local k1 = 2 * omega
+        local k2 = omega * omega
+        
+        local ex=tarX-curLook.X; local ey=tarY-curLook.Y; local ez=tarZ-curLook.Z
+        _springVelX=_springVelX+(k2*ex-k1*_springVelX)*dt; _springVelY=_springVelY+(k2*ey-k1*_springVelY)*dt; _springVelZ=_springVelZ+(k2*ez-k1*_springVelZ)*dt
+        
+        -- Anti-ringing: cap velocidade se muito grande
+        local velMag2 = _springVelX*_springVelX + _springVelY*_springVelY + _springVelZ*_springVelZ
+        if velMag2 > 4 then
+            local scale = 2 / sqrt(velMag2)
+            _springVelX = _springVelX * scale
+            _springVelY = _springVelY * scale
+            _springVelZ = _springVelZ * scale
+        end
+        
+        lx=curLook.X+_springVelX*dt; ly=curLook.Y+_springVelY*dt; lz=curLook.Z+_springVelZ*dt
+    elseif Config.MagnetismEnabled then
+        local dot=clamp(curLook.X*tarX+curLook.Y*tarY+curLook.Z*tarZ,-1,1); local angleFrac=(1-dot)*0.5
+        -- Cap magnetismo para evitar snap óbvio (0.85 máximo)
+        local strength = (Config.MagnetismStrength * 0.01) * (1 - angleFrac)
+        local t = clamp(strength * _cachedSmoothSpeed * dt, 0, 0.85)
+        lx=curLook.X+(tarX-curLook.X)*t; ly=curLook.Y+(tarY-curLook.Y)*t; lz=curLook.Z+(tarZ-curLook.Z)*t
+    else
+        local t=1-exp(-_cachedSmoothSpeed*dt); lx=curLook.X+(tarX-curLook.X)*t; ly=curLook.Y+(tarY-curLook.Y)*t; lz=curLook.Z+(tarZ-curLook.Z)*t
+    end
+    local lmag=sqrt(lx*lx+ly*ly+lz*lz); if lmag<1e-6 then return end
+    lx=lx/lmag; ly=ly/lmag; lz=lz/lmag; local newLook=Vector3.new(lx,ly,lz)
+    if Config.MaxAngularSpeed<3600 then
+        local dotVal=clamp(curLook:Dot(newLook),-1,1); local angleDeg=deg(acos(dotVal)); local maxAngle=Config.MaxAngularSpeed*dt
+        if angleDeg>maxAngle and maxAngle>0 then
+            local tLimited=(maxAngle/angleDeg); local llx=curLook.X+(lx-curLook.X)*tLimited; local lly=curLook.Y+(ly-curLook.Y)*tLimited; local llz=curLook.Z+(lz-curLook.Z)*tLimited
+            local llmag=sqrt(llx*llx+lly*lly+llz*llz); if llmag<1e-6 then return end; newLook=Vector3.new(llx/llmag,lly/llmag,llz/llmag)
+        end
+    end
+    local upVec=camCF.UpVector; local dot=newLook:Dot(upVec)
+    if dot>0.9999 or dot<-0.9999 then Camera.CFrame=CFrame.lookAt(camPos_,camPos_+newLook)
+    else Camera.CFrame=CFrame.lookAt(camPos_,camPos_+newLook,upVec) end
+end
+
+local _cachedAimFovR=0; local _lastAimFov=-1; local _lastAimVpY=-1
+local _bestTargetLastLoS=0; local _bestTargetLockStart=0; local _cachedFovR2=0
+local _cachedMaxDist2=Config.MaxDistance*Config.MaxDistance; local _cachedThreshR=0; local _cachedAspectRatio=1
+local _lastMaxDist=Config.MaxDistance; local _lastLockThresh=-1; local _lastThreshVpY=-1; local _lastAspectVpX=-1; local _lastAspectVpY=-1
+
+-- ===== WHITELIST AUTO-DETECTION COM PADRÃO DE STATS =====
+local _whitelistDetectionCache = {}  -- [userId] = {suspectAt, statsScore}
+local _lastWhitelistCheck = 0
+
+local function _isLikelyWhitelisted(player)
+    -- Verificar whitelist manual primeiro
+    if Config.Whitelist[player.UserId] then return true end
+    
+    -- Verificar cache com TTL
+    local cached = _whitelistDetectionCache[player.UserId]
+    if cached and (tick() - cached.suspectAt) < 120 then
+        if cached.statsScore > 0.75 then return true end
+    end
+    
+    return false
+end
+
+local function _updateWhitelistDetection(player, char)
+    if not char then return end
+    
+    local cc = _getCharCache(char)
+    if not cc or not cc.hum then return end
+    
+    local score = 0
+    
+    -- 1. Verificar se mata muitos inimigos (alto kill count = likely whitelisted)
+    local leaderstats = char.Parent:FindFirstChild("leaderstats")
+    if leaderstats then
+        local kills = leaderstats:FindFirstChild("Kills")
+        if kills and kills.Value > 50 then score = score + 0.3 end  -- Muitos kills
+        
+        local deaths = leaderstats:FindFirstChild("Deaths")
+        if deaths and deaths.Value > 0 then
+            local kd = (kills and kills.Value or 0) / deaths.Value
+            if kd > 3 then score = score + 0.2 end  -- KD muito alto
+        end
+    end
+    
+    -- 2. Verificar se sobreviveu muito tempo
+    local hum = cc.hum
+    if hum.MaxHealth > 75 then score = score + 0.15 end
+    if hum.Health == hum.MaxHealth then score = score + 0.1 end
+    
+    -- 3. Verificar posição privilegiada (muito acima ou em local seguro)
+    if cc.root then
+        local pos = cc.root.Position
+        if pos.Y > 200 then score = score + 0.15  -- Muito alto = flying/teleport
+        elseif pos.Y < -500 then score = score - 0.2 end  -- Morto na void
+    end
+    
+    -- 4. Tempo de jogo (usuários antigos têm mais chance de serem whitelisted)
+    if game:GetService("UserInputService") then
+        -- Placeholder para dados de antiguidade (Roblox não expõe direto)
+        score = score + 0.05
+    end
+    
+    score = min(score, 1.0)
+    
+    if score > 0.6 then
+        _whitelistDetectionCache[player.UserId] = {
+            suspectAt = tick(),
+            statsScore = score
+        }
+    end
+end
+
+local function _tryScorePlayer(player,camCF,camPos_,vpHalfX,vpHalfY,fovR2,fovR,maxDist2,threshR,nowTick,aspectRatio,lockAge,inLockMin)
+    -- ===== VALIDAÇÃO RIGOROSA DO PLAYER =====
+    if not player or player==false or not player.Parent then return end
+    if player==LocalPlayer then return end
+    if Config.Whitelist[player.UserId] then return end
+    if _isLikelyWhitelisted(player) then return end
+    
+    local char=player.Character
+    if not char or not char.Parent then return end  -- Adicionar .Parent check
+    
+    local cc=_getCharCache(char)
+    if not cc then return end
+    
+    local hum=cc.hum
+    if not hum or not hum.Parent then return end  -- Adicionar .Parent check
+    
+    local health=hum.Health
+    local maxHealth=hum.MaxHealth
+    if health<=0 or maxHealth<=0 then return end
+    
+    -- Atualizar cache de whitelist
+    _updateWhitelistDetection(player, char)
+    
+    if Config.TeamCheck and player.Team==LocalPlayer.Team then return end
+    
+    local root=cc.root
+    if not root or not root.Parent then return end  -- Adicionar .Parent check
+    
+    local rp=root.Position
+    local dx3=camPos_.X-rp.X
+    local dy3=camPos_.Y-rp.Y
+    local dz3=camPos_.Z-rp.Z
+    local dist3d2=dx3*dx3+dy3*dy3+dz3*dz3
+    if dist3d2>maxDist2 or dist3d2<0.01 then return end  -- Adicionar check de distância mínima
+    
+    local dist3d=sqrt(dist3d2)
+    
+    local aimPart=_getHitboxPart(char,cc)
+    if not aimPart or not aimPart.Parent then return end  -- Adicionar .Parent check
+    
+    local spX,spY,spZ,onScreen=getVPPoint(aimPart)
+    if not onScreen or spZ<=0.1 then return end  -- Aumentar threshold de profundidade
+    
+    local dx=(spX-vpHalfX)/aspectRatio
+    local dy=spY-vpHalfY
+    local d2d2=dx*dx+dy*dy
+    if d2d2>fovR2 then return end
+    
+    local d2d=sqrt(d2d2)
+    
+    if Config.WallCheck then
+        local vis=Lib._isVisible(char,true,camCF)
+        if not vis then
+            if Config.LockOnVisible and char==bestTarget then
+                if (nowTick-_bestTargetLastLoS)>=LOCK_GRACE_PERIOD then return end
+            else
+                return
+            end
+        else
+            if char==bestTarget then _bestTargetLastLoS=nowTick end
+        end
+    end
+    
+    if inLockMin and char~=bestTarget then return end
+    
+    local fovNorm=fovR>0 and (d2d/fovR) or 0
+    local distNorm=Config.MaxDistance>0 and (dist3d/Config.MaxDistance) or 0
+    local hpNorm=maxHealth>0 and (1-health/maxHealth) or 0
+    
+    -- Garantir que os pesos não causem valores NaN
+    local score=(_cachedWFOV*fovNorm+_cachedWDist*distNorm+_cachedWHP*hpNorm)*_cachedWInvTotal
+    if score~=score then return end  -- NaN check
+    
+    if Config.PriorityList[player.UserId] then score=score*0.1 end
+    
+    if bestTarget and char~=bestTarget and not inLockMin then
+        if lockAge<=Config.LockMaxTime then
+            if d2d>threshR then return end
+        end
+    end
+    
+    local state=Lib._getState(char,root,player.UserId)
+    return score,char,aimPart,root,state
+end
+
+local function findBestTarget(camCF,vpX,vpY)
+    local vpHalfX=vpX*0.5; local vpHalfY=vpY*0.5; local camPos_=camCF.Position; local nowTick=_frameTick
+    local fovForCalc=Config.FOV
+    if bestTarget and bestTargetRoot then local _bx=camPos_.X-bestTargetRoot.Position.X; local _by=camPos_.Y-bestTargetRoot.Position.Y; local _bz=camPos_.Z-bestTargetRoot.Position.Z; fovForCalc=Lib._getEffFov(sqrt(_bx*_bx+_by*_by+_bz*_bz),bestTargetState) end
+    if fovForCalc~=_lastAimFov or vpY~=_lastAimVpY then _lastAimFov=fovForCalc; _lastAimVpY=vpY; _cachedAimFovR=tan(rad(fovForCalc*0.5))/_tanHalfCamFOV*vpHalfY; _cachedFovR2=_cachedAimFovR*_cachedAimFovR end
+    local fovR=_cachedAimFovR; local fovR2=_cachedFovR2
+    if vpX~=_lastAspectVpX or vpY~=_lastAspectVpY then _lastAspectVpX=vpX; _lastAspectVpY=vpY; _cachedAspectRatio=vpX/vpY end
+    if Config.MaxDistance~=_lastMaxDist then _lastMaxDist=Config.MaxDistance; _cachedMaxDist2=Config.MaxDistance*Config.MaxDistance end
+    if Config.LockThreshold~=_lastLockThresh or vpY~=_lastThreshVpY then _lastLockThresh=Config.LockThreshold; _lastThreshVpY=vpY; _cachedThreshR=tan(rad(Config.LockThreshold*0.5))/_tanHalfCamFOV*vpHalfY end
+    local aspectRatio=_cachedAspectRatio; local maxDist2=_cachedMaxDist2; local threshR=_cachedThreshR
+    local bestScore=huge; local bTarget,bPart,bRoot,bState=nil,nil,nil,nil
+    local lockAge=nowTick-_bestTargetLockStart; local inLockMin=bestTarget~=nil and lockAge<Config.LockMinTime
+    local players,playerCount=getPlayerSnapshot()
+    for i=1,playerCount do
+        local player=players[i]
+        local score,char,aimPart,root,state=_tryScorePlayer(player,camCF,camPos_,vpHalfX,vpHalfY,fovR2,fovR,maxDist2,threshR,nowTick,aspectRatio,lockAge,inLockMin)
+        if score and score<bestScore then bestScore=score; bTarget=char; bPart=aimPart; bRoot=root; bState=state end
+    end
+    if inLockMin and bTarget==nil then
+        local cc=_getCharCache(bestTarget); local hum=cc and cc.hum
+        if hum and hum.Health>0 and bestTarget.Parent~=nil and bestAimPart and bestAimPart.Parent then return bestTarget,bestAimPart,bestTargetRoot,bestTargetState end
+        _bestTargetLockStart=0; return nil,nil,nil,nil
+    end
+    if bTarget~=bestTarget then
+        _bestTargetLastLoS=nowTick; _bestTargetLockStart=nowTick
+        -- FIX: reset spring ao trocar de alvo evita overshooting na direção errada
+        _springVelX=0; _springVelY=0; _springVelZ=0
+    end
+    return bTarget,bPart,bRoot,bState
+end
+
+Lib.Connections.MainRender=RunService.RenderStepped:Connect(function(dt)
+    dt=min(dt,0.05)
+    _frameCount=_frameCount+1; _frameTick=tick()
+    _camOkThisFrame=isCameraModifiable(); local camCF=Camera.CFrame; local vp=Camera.ViewportSize; local vpX=vp.X; local vpY=vp.Y
+
+    -- Flick: completamente independente do aimbot — roda sempre
+    if Config.FlickEnabled and _flickState~="idle" and _camOkThisFrame then
+        _flickTick(dt,camCF)
+        -- recapturar camCF após flick mover a câmera
+        camCF=Camera.CFrame
+    end
+
+    if HAS_DRAWING then
+        local showCircle=Config.ShowFOV and (Config.AimbotEnabled or Config.FlickEnabled)
+        if showCircle then
+            local td=nil
+            if bestTargetRoot then
+                local _cp=camCF.Position; local _dx=_cp.X-bestTargetRoot.Position.X; local _dy=_cp.Y-bestTargetRoot.Position.Y; local _dz=_cp.Z-bestTargetRoot.Position.Z
+                td=sqrt(_dx*_dx+_dy*_dy+_dz*_dz)
+            end
+            Lib._fovCircle(td)
+        elseif _fovDirty_vis~=false then
+            _fovDirty_vis=false
+            for _,l in ipairs(_fovLines) do l.Visible=false end
+        end
+        if Config.CrosshairEnabled then if vp~=_crosshairVPCache then Lib._xhair() end end
+    end
+
+    -- Update suspicion level
+    _updateSuspicion(dt)
+    
+    -- Detect aimbot strategy periodically
+    _detectAimbotStrategy()
+    
+    if not Config.AimbotEnabled then
+        bestTarget=nil; bestAimPart=nil; bestTargetRoot=nil; bestTargetState=nil
+        _springVelX=0; _springVelY=0; _springVelZ=0
+        if HAS_DRAWING then Lib._setFovColor(_fovColors.idle) end
+    else
+        bestTarget,bestAimPart,bestTargetRoot,bestTargetState=findBestTarget(camCF,vpX,vpY)
+        if bestTarget and bestAimPart then
+            if HAS_DRAWING then local slot=_visCache[bestTarget]; local vis=slot and slot.vis or false; Lib._setFovColor(vis and _fovColors.locked or _fovColors.tracked) end
+            -- ← CORREÇÃO: Aplicar aim apenas se estratégia permitir (não é SILENT_ONLY)
+            if _detectedStrategy ~= "SILENT_ONLY" and _flickState == "idle" then
+                local aimPos=getFinalAimPosition(bestAimPart,bestTargetState,camCF.Position)
+                if aimPos then applyAim(aimPos,dt,camCF) end
+            end
+        else
+            if HAS_DRAWING then Lib._setFovColor(_fovColors.idle) end
+        end
+    end
+
+    if _runESP then _runESP(camCF,vp,vpX,vpY) end
+    _updateOffScreen(camCF,vpX,vpY)
+    Lib._hud(camCF,vpX,vpY)
+end)
+
+local _localMouse=LocalPlayer:GetMouse(); local triggerbotFiring=false; local _triggerbotLastTarget=nil
+Lib.Connections.Triggerbot=RunService.Heartbeat:Connect(function()
+    if not Config.TriggerbotEnabled then return end; if not HAS_MOUSE1CLICK then return end
+    local shouldFire=false; local currentTarget=nil
+    if Config.TriggerIntegrated and Config.AimbotEnabled and bestTarget then local lvis=Lib._isVisible(bestTarget,true); if lvis then shouldFire=true; currentTarget=bestTarget end
+    else
+        local target=_localMouse.Target; if target and target.Parent then local char=target.Parent; local cc=_charCache[char]; if cc and cc.hum then local player=_charToPlayer[char]; if player and player~=LocalPlayer then if not(Config.TeamCheck and player.Team==LocalPlayer.Team) then if not Config.Whitelist[player.UserId] then local vis=Lib._isVisible(char,true); if vis then shouldFire=true; currentTarget=char end end end end end end
+    end
+    if not shouldFire then return end
+    if triggerbotFiring and currentTarget~=_triggerbotLastTarget then triggerbotFiring=false end
+    if triggerbotFiring then return end
+    triggerbotFiring=true; _triggerbotLastTarget=currentTarget
+    task.delay(Config.TriggerDelay/100,function() if Config.TriggerbotEnabled then pcall(mouse1click) end; triggerbotFiring=false end)
+end)
+
+local recoilHolding=false; local _recoilConn=nil
+local function _stopRecoilLoop() recoilHolding=false; if _recoilConn then _recoilConn:Disconnect(); _recoilConn=nil end end
+local function _startRecoilLoop(profile)
+    if not profile or not profile.RecoilY then return end; _stopRecoilLoop(); recoilHolding=true
+    local recoilY=profile.RecoilY or 0; local recoilX=profile.RecoilX or 0
+    _recoilConn=RunService.Heartbeat:Connect(function()
+        if not recoilHolding or not Config.RecoilEnabled then _stopRecoilLoop(); return end
+        if not isCameraModifiable() then return end; Camera.CFrame=Camera.CFrame*CFrame.Angles(-recoilY,recoilX,0)
+    end)
+end
+Lib.Connections.RecoilInput=UserInputService.InputBegan:Connect(function(input,gp)
+    if gp or not Config.RecoilEnabled then return end; if input.UserInputType~=Enum.UserInputType.MouseButton1 then return end
+    local char=LocalPlayer.Character; if not char then return end; local tool=char:FindFirstChildOfClass("Tool"); if not tool then return end
+    local profile=Config.WeaponProfiles[tool.Name]; if not profile or not profile.RecoilY then return end; _startRecoilLoop(profile)
+end)
+Lib.Connections.RecoilEnd=UserInputService.InputEnded:Connect(function(input) if input.UserInputType==Enum.UserInputType.MouseButton1 then _stopRecoilLoop() end end)
+
+-- ================================================================
+-- RCS DINÂMICO
+-- Aprende o padrão de recoil real da câmera medindo o desvio
+-- entre frames durante o disparo, e compensa automaticamente.
+-- Quanto mais atirar, mais preciso fica. Reseta ao trocar de arma.
+-- ================================================================
+local _rcsLookPrev=nil          -- LookVector do frame anterior durante disparo
+local _rcsPattern={}            -- padrão acumulado {dx, dy} por tiro
+local _rcsSampleIdx=0           -- índice circular de amostras
+local _rcsApplyIdx=0            -- qual amostra estamos aplicando agora
+local _rcsFiring=false          -- Mouse1 está pressionado
+local _rcsFrameCount=0          -- frames desde o início do disparo atual
+local _rcsLearned=false         -- já tem padrão aprendido suficiente
+
+_rcsClearPattern=function()
+    _rcsPattern={}; _rcsSampleIdx=0; _rcsApplyIdx=0; _rcsLearned=false
+end
+
+-- Chamado pelo InputBegan/Ended do Mouse1
+local function _rcsSetFiring(v)
+    _rcsFiring=v
+    if v then
+        _rcsLookPrev=nil; _rcsFrameCount=0; _rcsApplyIdx=0
+    else
+        _rcsLookPrev=nil
+    end
+end
+
+Lib.Connections.RCSInput=UserInputService.InputBegan:Connect(function(inp,gp)
+    if gp then return end
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then _rcsSetFiring(true) end
+end)
+Lib.Connections.RCSEnd=UserInputService.InputEnded:Connect(function(inp)
+    if inp.UserInputType==Enum.UserInputType.MouseButton1 then _rcsSetFiring(false) end
+end)
+-- Limpar padrão ao trocar de arma (novo padrão a aprender)
+Lib.Connections.RCSTool=UserInputService.InputBegan:Connect(function() end)  -- placeholder
+local _rcsToolConn=nil
+local function _hookRCSTool(char)
+    if _rcsToolConn then pcall(function() _rcsToolConn:Disconnect() end); _rcsToolConn=nil end
+    if not char then return end
+    _rcsToolConn=char.ChildAdded:Connect(function(c) if c:IsA("Tool") then _rcsClearPattern(); notify("RCS: padrão resetado — nova arma","info",2) end end)
+end
+Lib.Connections.RCSCharAdded=LocalPlayer.CharacterAdded:Connect(function(char) _hookRCSTool(char); _rcsClearPattern() end)
+_hookRCSTool(LocalPlayer.Character)
+
+-- Tick do RCS — roda no Heartbeat para máxima precisão temporal
+Lib.Connections.RCSTick=RunService.Heartbeat:Connect(function(dt)
+    if not Config.DynRCSEnabled or not isCameraModifiable() then _rcsLookPrev=nil; return end
+    local camCF=Camera.CFrame
+    local curLook=camCF.LookVector
+    if not _rcsFiring then _rcsLookPrev=curLook; return end
+
+    local maxSamples=Config.DynRCSMaxSamples
+    local strength=Config.DynRCSStrength*0.01
+
+    -- FASE 1: APRENDIZADO — medir desvio real ANTES de qualquer compensação
+    if _rcsLookPrev then
+        local dx=curLook.X-_rcsLookPrev.X
+        local dy=curLook.Y-_rcsLookPrev.Y
+        local dz=curLook.Z-_rcsLookPrev.Z
+        local dMag=sqrt(dx*dx+dy*dy+dz*dz)
+        if dMag>0.0005 then
+            _rcsSampleIdx=(_rcsSampleIdx%maxSamples)+1
+            _rcsPattern[_rcsSampleIdx]={dx=dx,dy=dy,dz=dz}
+            if #_rcsPattern>=3 then _rcsLearned=true end
+            _rcsFrameCount=_rcsFrameCount+1
+        end
+    end
+
+    -- FIX: salvar curLook ANTES da compensação — evita medir o próprio correção como recoil
+    _rcsLookPrev=curLook
+
+    -- FASE 2: APLICAÇÃO — só aplica após ter padrão aprendido E pelo menos 1 disparo de diferença
+    -- Usa o sample da rodada ANTERIOR (não a atual) para não compensar o que ainda não aprendeu
+    if _rcsLearned and _rcsFrameCount>1 then
+        -- applyIdx aponta para 1 amostra atrás do índice atual (padrão da rodada anterior)
+        local applyIdx=((_rcsApplyIdx)%maxSamples)+1
+        local sample=_rcsPattern[applyIdx]
+        if sample then
+            _rcsApplyIdx=_rcsApplyIdx+1
+            local origin=camCF.Position
+            local lx=curLook.X-sample.dx*strength
+            local ly=curLook.Y-sample.dy*strength
+            local lz=curLook.Z-sample.dz*strength
+            local lmag=sqrt(lx*lx+ly*ly+lz*lz)
+            if lmag>1e-6 then
+                lx=lx/lmag; ly=ly/lmag; lz=lz/lmag
+                local newLook=Vector3.new(lx,ly,lz)
+                local upVec=camCF.UpVector; local dot=newLook:Dot(upVec)
+                if dot>0.9999 or dot<-0.9999 then Camera.CFrame=CFrame.lookAt(origin,origin+newLook)
+                else Camera.CFrame=CFrame.lookAt(origin,origin+newLook,upVec) end
+            end
+        end
+    end
+    -- NÃO atualizar _rcsLookPrev aqui — já foi salvo antes da compensação acima
+end)
+
+-- ================================================================
+-- AUTO-PEEK
+-- Quando ativado: detecta a cobertura mais próxima atrás de você,
+-- calcula a direção lateral em relação ao alvo, faz o peek,
+-- e retorna automaticamente após o shot do triggerbot ou timeout.
+-- ================================================================
+local _peekState="idle"     -- "idle" | "peeking" | "returning"
+local _peekOriginCF=nil     -- CFrame do HRP antes do peek
+local _peekTargetPos=nil    -- posição lateral do peek
+local _peekReturnPos=nil    -- posição de retorno
+local _peekProgress=0
+local _peekTimer=0
+local PEEK_TIMEOUT=1.5      -- seg máx no peek antes de retornar
+
+_peekReset=function()
+    _peekState="idle"; _peekOriginCF=nil; _peekTargetPos=nil
+    _peekReturnPos=nil; _peekProgress=0; _peekTimer=0
+end
+
+_peekStart=function()
+    if _peekState~="idle" then return end
+    if not Config.AutoPeekEnabled then return end
+    local char=LocalPlayer.Character; if not char then return end
+    local hrp=char:FindFirstChild("HumanoidRootPart"); if not hrp then return end
+    if not isCameraModifiable() then return end
+    -- determinar direção do peek: lateral em relação ao alvo (ou câmera)
+    local camCF=Camera.CFrame; local origin=hrp.Position
+    local peekDir
+    if bestTarget and bestTargetRoot then
+        -- perpendicular ao vetor câmera→alvo, no plano horizontal
+        local toTarget=(bestTargetRoot.Position-origin)*Vector3.new(1,0,1)
+        local tMag=toTarget.Magnitude
+        if tMag>0.1 then
+            local fwd=toTarget/tMag
+            peekDir=Vector3.new(-fwd.Z,0,fwd.X)  -- rodar 90° no plano XZ
+        end
+    end
+    if not peekDir then
+        -- sem alvo: peek para a direita da câmera
+        peekDir=camCF.RightVector*Vector3.new(1,0,1)
+        local pm=peekDir.Magnitude; if pm>0.01 then peekDir=peekDir/pm end
+    end
+    -- verificar qual lado tem mais espaço (esquerda ou direita)
+    local rp=RaycastParams.new(); rp.FilterType=Enum.RaycastFilterType.Exclude; rp.FilterDescendantsInstances={char}
+    local peekDist=Config.AutoPeekDist
+    local hitR=workspace:Raycast(origin,peekDir*peekDist,rp)
+    local hitL=workspace:Raycast(origin,-peekDir*peekDist,rp)
+    local distR=hitR and hitR.Distance or peekDist
+    local distL=hitL and hitL.Distance or peekDist
+    -- escolher o lado com mais espaço, respeitando cobertura
+    local chosenDir=distR>=distL and peekDir or -peekDir
+    local chosenDist=max(distR,distL)-0.5  -- margem de segurança
+    if chosenDist<0.5 then notify("Auto-Peek: sem espaço para peekar","warn",2); return end
+    _peekOriginCF=hrp.CFrame
+    _peekTargetPos=origin+chosenDir*min(chosenDist,peekDist)
+    _peekReturnPos=origin
+    _peekProgress=0; _peekTimer=0
+    _peekState="peeking"
+end
+
+Lib.Connections.AutoPeekTick=RunService.Heartbeat:Connect(function(dt)
+    if not Config.AutoPeekEnabled or _peekState=="idle" then return end
+    local char=LocalPlayer.Character; if not char then _peekReset(); return end
+    local hrp=char:FindFirstChild("HumanoidRootPart"); if not hrp then _peekReset(); return end
+    local peekSpeed=Config.AutoPeekSpeed*dt
+
+    if _peekState=="peeking" then
+        _peekTimer=_peekTimer+dt
+        local cur=hrp.Position
+        local target=_peekTargetPos
+        local dx=target.X-cur.X; local dz=target.Z-cur.Z
+        local dist=sqrt(dx*dx+dz*dz)
+        if dist<0.15 or _peekTimer>=PEEK_TIMEOUT then
+            -- chegou — disparar se triggerbot não estiver ativo
+            if HAS_MOUSE1CLICK and not Config.TriggerbotEnabled then pcall(mouse1click) end
+            _peekState="returning"; _peekTimer=0; _peekProgress=0
+        else
+            local step=min(peekSpeed,dist); local nx=cur.X+dx/dist*step; local nz=cur.Z+dz/dist*step
+            hrp.CFrame=CFrame.new(nx,cur.Y,nz)*(_peekOriginCF-_peekOriginCF.Position)
+        end
+    elseif _peekState=="returning" then
+        _peekTimer=_peekTimer+dt
+        local cur=hrp.Position
+        local target=_peekReturnPos
+        local dx=target.X-cur.X; local dz=target.Z-cur.Z
+        local dist=sqrt(dx*dx+dz*dz)
+        if dist<0.15 or _peekTimer>=PEEK_TIMEOUT then
+            -- voltar exatamente para a posição original
+            hrp.CFrame=CFrame.new(_peekReturnPos)*(_peekOriginCF-_peekOriginCF.Position)
+            _peekReset(); notify("Auto-Peek: retornou","info",1.5)
+        else
+            local step=min(peekSpeed,dist); local nx=cur.X+dx/dist*step; local nz=cur.Z+dz/dist*step
+            hrp.CFrame=CFrame.new(nx,cur.Y,nz)*(_peekOriginCF-_peekOriginCF.Position)
+        end
+    end
+end)
+
+local function _onToolEquipped(tool)
+    if not tool:IsA("Tool") then return end
+    if Config.WeaponProfiles[tool.Name] then
+        local p=Config.WeaponProfiles[tool.Name]; if p.FOV then Config.FOV=p.FOV end; if p.Smooth then Config.Smooth=p.Smooth; _updateSmoothCache() end
+        _lastAimFov=-1; _lastFovDisplay=-1; _fovDirty_vis=nil; Lib._fovCircle(); pcall(Lib._updateAllUI); notify("Perfil de arma: "..tool.Name,"info")
+    end
+end
+local _toolChildConn=nil; Lib.Connections.ToolChildConn=nil
+local function _hookToolEvents(char)
+    if _toolChildConn then _toolChildConn:Disconnect(); _toolChildConn=nil end; if not char then return end
+    local existing=char:FindFirstChildOfClass("Tool"); if existing then _onToolEquipped(existing) end
+    _toolChildConn=char.ChildAdded:Connect(_onToolEquipped); Lib.Connections.ToolChildConn=_toolChildConn
+end
+Lib.Connections.ToolCharAdded=LocalPlayer.CharacterAdded:Connect(_hookToolEvents); _hookToolEvents(LocalPlayer.Character)
+
+Lib.Connections.CharAdded=LocalPlayer.CharacterAdded:Connect(function()
+    bestTarget=nil; bestAimPart=nil; bestTargetRoot=nil; bestTargetState=nil
+    _visLastChar=nil; _floorLastChar=nil; _wallFilterDirty=true
+    _lastHudHPPct=-1; _lastHudDist=-1; _lastHudVisible=false; _lastHudLosOk=nil; _lastHudName=""; _lastHudVpX=-1
+    tbl_clear(_chamHPCache); _bestTargetLastLoS=0; _bestTargetLockStart=0; _fovDirty_vis=nil; tbl_clear(_stateSlot)
+    _clearWeakTable(_visCache); _clearWeakTable(_boneCache)
+    for _,conn in pairs(_boneCacheConns) do pcall(function() conn:Disconnect() end) end; tbl_clear(_boneCacheConns)
+    _clearWeakTable(_inVehicleCache)
+    for _,conns in pairs(_inVehicleEventConns) do pcall(function() conns[1]:Disconnect() end); pcall(function() conns[2]:Disconnect() end) end; tbl_clear(_inVehicleEventConns)
+    for _,conn in pairs(_charCacheConns) do pcall(function() conn:Disconnect() end) end; tbl_clear(_charCacheConns)
+    _clearWeakTable(_charCache); notify("Respawn — Aimbot resetado","info")
+end)
+
+function Lib._connectDied(char,player)
+    if diedConnections[char] then return end
+    local cc=_getCharCache(char); local hum=cc and cc.hum
+    if not hum then
+        task.delay(0.1,function()
+            if not isRunning then return end; if diedConnections[char] then return end
+            local cc2=_getCharCache(char); local hum2=cc2 and cc2.hum; if not hum2 then return end
+            diedConnections[char]=hum2.Died:Connect(function() _onPlayerDied(char,player) end)
+        end); return
+    end
+    diedConnections[char]=hum.Died:Connect(function() _onPlayerDied(char,player) end)
+end
+
+_onPlayerDied=function(char,player)
+    if not player then player=_charToPlayer[char] end
+    if Lib then clearPlayerESP(player,char) end
+    if bestTarget==char then bestTarget=nil; bestAimPart=nil; _bestTargetLockStart=0 end
+    if diedConnections[char] then pcall(function() diedConnections[char]:Disconnect() end); diedConnections[char]=nil end
+    if _charToPlayer[char] then _charToPlayer[char]=nil end
+    if player then _stateSlot[player.UserId]=nil end
+end
+
+for _,p in ipairs(Players:GetPlayers()) do if p.Character then _charToPlayer[p.Character]=p end end
+
+end)()
+
+-- ================================================================
+-- 6. ESP / VISUALS
+-- ================================================================
+;(function()
+
+local BONES_R15={"Head","UpperTorso","UpperTorso","LowerTorso","UpperTorso","LeftUpperArm","LeftUpperArm","LeftLowerArm","LeftLowerArm","LeftHand","UpperTorso","RightUpperArm","RightUpperArm","RightLowerArm","RightLowerArm","RightHand","LowerTorso","LeftUpperLeg","LeftUpperLeg","LeftLowerLeg","LeftLowerLeg","LeftFoot","LowerTorso","RightUpperLeg","RightUpperLeg","RightLowerLeg","RightLowerLeg","RightFoot"}
+local BONES_R6={"Head","Torso","Torso","Left Arm","Torso","Right Arm","Torso","Left Leg","Torso","Right Leg"}
+
+local function _buildBoneCache(char)
+    local isR15=char:FindFirstChild("UpperTorso")~=nil; local map=isR15 and BONES_R15 or BONES_R6; local n=#map/2; local cache={}
+    for i=1,n do cache[i*2-1]=char:FindFirstChild(map[i*2-1]); cache[i*2]=char:FindFirstChild(map[i*2]) end
+    cache.n=n; _boneCache[char]=cache
+    local old=_boneCacheConns[char]; if old then pcall(function() old:Disconnect() end) end
+    _boneCacheConns[char]=char.ChildAdded:Connect(function(child) if child:IsA("BasePart") or child:IsA("MeshPart") then _boneCache[char]=nil end end)
+end
+local function getBoneCacheParts(char) if not _boneCache[char] then _buildBoneCache(char) end; return _boneCache[char] end
+
+local function getESPColor(player,myTeam,isWhitelisted)
+    if not Config.TeamColorESP then return Config.ESPColor end
+    if isWhitelisted then return _C_WL_ESP end
+    if myTeam and player.Team==myTeam then return _C_TEAM_OK end
+    if player.Team==nil then return _C_TEAM_NONE end; return Config.ESPColor
+end
+
+local _hpColorCache={}
+do for k=0,20 do _hpColorCache[k]=Color3.fromHSV((k/20)*0.33,0.9,1) end end
+local _C_OVERHEAL=Color3.fromRGB(255,215,0)
+function Lib._getHP(hp) if hp>1.0 then return _C_OVERHEAL end; return _hpColorCache[clamp(floor(hp*20),0,20)] end
+
+local function _esp_updateCorners(player,char,cc,camCF,vpHalfX,vpHalfY,espColor)
+    if not Config.ESPEnabled then
+        if _activeCorners[player] then releaseCornerLines(_activeCorners[player]); _activeCorners[player]=nil; _cornerPosCache[player]=nil end
+        return false,0,0,0,0
+    end
+    local head=cc.head; local root=cc.root; local lShoulder=cc.lShoulder; local rShoulder=cc.rShoulder
+    local screenRootX,screenRootY,screenRootZ,onScreen=getVPPoint(root)
+    if not onScreen or screenRootZ<=0 then if _activeCorners[player] then releaseCornerLines(_activeCorners[player]); _activeCorners[player]=nil; _cornerPosCache[player]=nil end; return false,screenRootX,screenRootY,screenRootZ,onScreen and 1 or 0 end
+    local rootPos=root.Position; local rootPosY=rootPos.Y
+    local topY_w=head and (head.Position.Y+head.Size.Y*0.5+0.15) or rootPosY+3.2; local botY_w=rootPosY-root.Size.Y*0.5
+    local rootDepth=max(screenRootZ,0.001); local pps=vpHalfY/(_tanHalfCamFOV*rootDepth)
+    local sTopY=screenRootY-(topY_w-rootPosY)*pps; local sBotY=screenRootY-(botY_w-rootPosY)*pps
+    local bh=abs(sBotY-sTopY); local bw
+    if lShoulder and rShoulder then local sLx=getVPPoint(lShoulder); local sRx=getVPPoint(rShoulder); bw=max(abs(sRx-sLx)*1.3,bh*0.45) else bw=bh*0.5 end
+    local boxX=screenRootX-bw*0.5; local boxY=sTopY; local boxW=bw; local boxH=bh
+    if not _activeCorners[player] then _activeCorners[player]=getCornerLines() end
+    local cl=_activeCorners[player]; local cs=min(bw,bh)*0.25; local x1,y1=boxX,boxY; local x2,y2=boxX+bw,boxY+bh
+    local cp=_cornerPosCache[player]; local isLocked=(char==bestTarget); local cornerThickness=isLocked and 2.5 or 1.5
+    local dirty=not cp or abs(cp[1]-x1)>CORNER_POS_THRESH or abs(cp[2]-y1)>CORNER_POS_THRESH or abs(cp[3]-x2)>CORNER_POS_THRESH or abs(cp[4]-y2)>CORNER_POS_THRESH or abs(cp[5]-cs)>CORNER_POS_THRESH or cp[6]~=isLocked or cp[7]~=espColor
+    if dirty then
+        if not cp then cp={}; _cornerPosCache[player]=cp end
+        cp[1]=x1;cp[2]=y1;cp[3]=x2;cp[4]=y2;cp[5]=cs;cp[6]=isLocked;cp[7]=espColor
+        cl[1].From=Vector2.new(x1,y1);cl[1].To=Vector2.new(x1+cs,y1); cl[2].From=Vector2.new(x1,y1);cl[2].To=Vector2.new(x1,y1+cs)
+        cl[3].From=Vector2.new(x2,y1);cl[3].To=Vector2.new(x2-cs,y1); cl[4].From=Vector2.new(x2,y1);cl[4].To=Vector2.new(x2,y1+cs)
+        cl[5].From=Vector2.new(x1,y2);cl[5].To=Vector2.new(x1+cs,y2); cl[6].From=Vector2.new(x1,y2);cl[6].To=Vector2.new(x1,y2-cs)
+        cl[7].From=Vector2.new(x2,y2);cl[7].To=Vector2.new(x2-cs,y2); cl[8].From=Vector2.new(x2,y2);cl[8].To=Vector2.new(x2,y2-cs)
+        for j=1,8 do cl[j].Color=espColor; cl[j].Thickness=cornerThickness; cl[j].Visible=true end
+    end
+    if _activeESP[player] then _activeESP[player].Visible=false; _poolESP[#_poolESP+1]=_activeESP[player]; _activeESP[player]=nil end
+    return true,boxX,boxY,boxW,boxH
+end
+
+local function _esp_updateHealthBar(player,screenRootX,screenRootY,onScreen,hp,boxOK,boxX,boxY,boxH)
+    if not Config.HealthBarEnabled then local hb=_activeHB[player]; if hb then _activeHB[player]=nil; hb.bg.Visible=false; hb.fill.Visible=false; _poolHB[#_poolHB+1]=hb end; return end
+    local barX,barY,bh; if boxOK then barX=boxX-HB_W-HB_O; barY=boxY; bh=boxH elseif onScreen then barX=screenRootX-20-HB_W-HB_O; barY=screenRootY-40; bh=40 end
+    if barX then
+        if not _activeHB[player] then local pn=#_poolHB; if pn>0 then _activeHB[player]=_poolHB[pn]; _poolHB[pn]=nil else _activeHB[player]={bg=makeDrawing("Square",{Filled=true},true),fill=makeDrawing("Square",{Filled=true},true)} end end
+        local hb=_activeHB[player]; local fh=max(1,floor(bh*min(hp,1)))
+        hb.bg.Position=Vector2.new(barX,barY); hb.bg.Size=Vector2.new(HB_W,bh); hb.bg.Visible=true
+        hb.fill.Position=Vector2.new(barX,barY+(bh-fh)); hb.fill.Size=Vector2.new(HB_W,fh); hb.fill.Color=Lib._getHP(hp); hb.fill.Visible=true
+    else local hb=_activeHB[player]; if hb then _activeHB[player]=nil; hb.bg.Visible=false; hb.fill.Visible=false; _poolHB[#_poolHB+1]=hb end end
+end
+
+local function _esp_updateLabels(player,char,uid,uidMod,espColor,screenRootX,screenRootY,onScreen,hp,dist,boxOK,boxY)
+    if not Config.LabelsEnabled or not onScreen then local lb=_activeLabels[player]; if lb then lb.name.Visible=false; lb.dist.Visible=false; _poolLabel[#_poolLabel+1]=lb.name; _poolLabel[#_poolLabel+1]=lb.dist; _activeLabels[player]=nil end; return end
+    if not _activeLabels[player] then local n=poolGet(_poolLabel,"Text"); local d=poolGet(_poolLabel,"Text"); n.Size=13; n.Center=true; n.Outline=true; n.OutlineColor=_C_BLACK; d.Size=11; d.Center=true; d.Outline=true; d.OutlineColor=_C_BLACK; _activeLabels[player]={name=n,dist=d} end
+    local lb=_activeLabels[player]
+    if (espFrameCount+uidMod)%3==0 then
+        local slot_=_stateSlot[uid]
+        local moveIcon=(slot_ and slot_.state.isMoving) and " ►" or " ■"
+        local lockIcon=(char==bestTarget) and " 🎯" or ""
+        local weaponStr=""
+        if Config.WeaponLabelEnabled then
+            -- usar cache — atualizado pelo ChildAdded/ChildRemoved do char
+            local wn=_weaponCache[player]
+            if wn==nil then
+                local tool=char:FindFirstChildOfClass("Tool")
+                wn=tool and tool.Name:sub(1,10) or ""; _weaponCache[player]=wn
+            end
+            if wn~="" then weaponStr=" ["..wn.."]" end
+        end
+        lb.name.Text=sfmt("%s%s%s%s",player.DisplayName,moveIcon,lockIcon,weaponStr)
+        lb.dist.Text=sfmt("%dm  HP:%d%%",floor(dist),floor(hp*100))
+    end
+    local lp=_labelPosCache[player]; local labelY=boxOK and (boxY-2) or (screenRootY-50); local nameY=labelY-14; local distY=labelY-2
+    if not lp or abs(lp[1]-screenRootX)>0.5 or abs(lp[2]-nameY)>0.5 or lp[3]~=espColor then
+        if not lp then lp={}; _labelPosCache[player]=lp end; lp[1]=screenRootX; lp[2]=nameY; lp[3]=espColor
+        lb.name.Color=espColor; lb.name.Position=Vector2.new(screenRootX,nameY)
+        lb.dist.Color=_C_LABEL_DIST; lb.dist.Position=Vector2.new(screenRootX,distY)
+    end
+    lb.name.Visible=true; lb.dist.Visible=true
+end
+
+local function _esp_updateSkeleton(player,char,espColor,camPos2,camLook2)
+    if not Config.SkeletonEnabled then if _activeSkel[player] then releaseSkeletonLines(_activeSkel[player]); _activeSkel[player]=nil end; return end
+    local bones=getBoneCacheParts(char); if not bones then return end; local bCount=bones.n or 0
+    local existingSkel=_activeSkel[player]; if existingSkel and #existingSkel~=bCount then releaseSkeletonLines(existingSkel); _activeSkel[player]=nil end
+    if not _activeSkel[player] then _activeSkel[player]=getSkeletonLines(bCount) end
+    local lines=_activeSkel[player]; local clx=camLook2.X; local cly=camLook2.Y; local clz=camLook2.Z
+    local cx2=camPos2.X; local cy2=camPos2.Y; local cz2=camPos2.Z; local colorChanged=_skelColorCache[player]~=espColor
+    if colorChanged then _skelColorCache[player]=espColor end
+    for j=1,bCount do
+        local line=lines[j]; if not line then continue end; local pA=bones[j*2-1]; local pB=bones[j*2]
+        if pA and pB and pA.Parent and pB.Parent then
+            local toAx=pA.Position.X-cx2; local toAy=pA.Position.Y-cy2; local toAz=pA.Position.Z-cz2
+            local toBx=pB.Position.X-cx2; local toBy=pB.Position.Y-cy2; local toBz=pB.Position.Z-cz2
+            local dotA=clx*toAx+cly*toAy+clz*toAz; local dotB=clx*toBx+cly*toBy+clz*toBz
+            if dotA<BEHIND_MARGIN and dotB<BEHIND_MARGIN then line.Visible=false; continue end
+            local sAx,sAy,sAz=getVPPoint(pA); local sBx,sBy,sBz=getVPPoint(pB)
+            if sAz>0 and sBz>0 then line.From=Vector2.new(sAx,sAy); line.To=Vector2.new(sBx,sBy); if colorChanged then line.Color=espColor end; line.Visible=true
+            else line.Visible=false end
+        else line.Visible=false end
+    end
+end
+
+local function _esp_updateChams(player,char,hp)
+    if not char or not char.Parent then
+        releaseHighlight(char)
+        _chamHPCache[player]=nil
+        return
+    end
+    if Config.ChamEnabled then
+        local hl=getHighlight(char)
+        if hl and hl.Parent then
+            if Config.ChamHPColor then
+                local prev=_chamHPCache[player]
+                if not prev or abs(prev-hp)>0.005 then
+                    _chamHPCache[player]=hp
+                    hl.FillColor=Lib._getHP(hp)
+                end
+            else
+                hl.FillColor=Config.ChamFillColor
+            end
+        end
+    else
+        releaseHighlight(char)
+        _chamHPCache[player]=nil
+    end
+end
+
+local _weaponCache={}  -- [player] = toolName cached, atualizado pelo ChildAdded do char
+
+local _tracerFromCache={}; local _tracerToX={}; local _tracerToY={}
+
+local function _esp_updateTracer(player,screenRootX,screenRootY,onScreen,espColor,vpY,vpHalfX,vpHalfY)
+    if not Config.TracerEnabled or not onScreen then
+        local tr=_activeTracers[player]
+        if tr and tr.Parent then
+            tr.Visible=false
+            _poolTracer[#_poolTracer+1]=tr
+        end
+        _activeTracers[player]=nil
+        _tracerToX[player]=nil
+        _tracerToY[player]=nil
+        return
+    end
+    if not _activeTracers[player] then _activeTracers[player]=poolGet(_poolTracer,"Line") end
+    local tr=_activeTracers[player]
+    if not tr or not tr.Parent then _activeTracers[player]=nil; return end
+    local originKey=Config.TracerOrigin
+    local expectedY=originKey=="Bottom" and vpY or vpHalfY
+    local fromV2=_tracerFromCache[originKey]
+    if not fromV2 or fromV2.X~=vpHalfX or fromV2.Y~=expectedY then
+        fromV2=Vector2.new(vpHalfX,expectedY)
+        _tracerFromCache[originKey]=fromV2
+    end
+    tr.From=fromV2
+    if _tracerToX[player]~=screenRootX or _tracerToY[player]~=screenRootY then
+        _tracerToX[player]=screenRootX
+        _tracerToY[player]=screenRootY
+        tr.To=Vector2.new(screenRootX,screenRootY)
+    end
+    tr.Color=espColor
+    tr.Visible=true
+end
+
+local function _esp_updateHeadDot(player,char,cc,espColor)
+    if not Config.HeadDotEnabled then
+        local hd=_activeHDots[player]
+        if hd and hd.Parent then
+            hd.Visible=false
+            _poolHDot[#_poolHDot+1]=hd
+        end
+        _activeHDots[player]=nil
+        return
+    end
+    local head=cc.head
+    if not head or not head.Parent then
+        local hd=_activeHDots[player]
+        if hd and hd.Parent then
+            hd.Visible=false
+            _poolHDot[#_poolHDot+1]=hd
+        end
+        _activeHDots[player]=nil
+        return
+    end
+    local hx,hy,hz,onSc=getVPPoint(head)
+    if not onSc or hz<=0 then
+        local hd=_activeHDots[player]
+        if hd and hd.Parent then
+            hd.Visible=false
+            _poolHDot[#_poolHDot+1]=hd
+        end
+        _activeHDots[player]=nil
+        return
+    end
+    if not _activeHDots[player] then
+        local n=#_poolHDot
+        if n>0 then
+            _activeHDots[player]=_poolHDot[n]
+            _poolHDot[n]=nil
+        else
+            _activeHDots[player]=makeDrawing("Circle",{Filled=true,NumSides=16,Thickness=0},true)
+        end
+    end
+    local hd=_activeHDots[player]
+    if not hd or not hd.Parent then _activeHDots[player]=nil; return end
+    local r=clamp(floor(6/max(hz,1)*50),2,8)
+    hd.Position=Vector2.new(hx,hy)
+    hd.Radius=r
+    hd.Color=espColor
+    hd.Visible=true
+end
+
+local _espWasActive=false; local _hlCheckCounter=0; local _HL_CHECK_INTERVAL=300
+
+_runESP=function(camCF,vp,vpX,vpY)
+    if not HAS_DRAWING then return end; espFrameCount=(espFrameCount+1)%65536
+    _hlCheckCounter=_hlCheckCounter+1
+    if _hlCheckCounter>=_HL_CHECK_INTERVAL then _hlCheckCounter=0; for char in next,_activeHL do if not char.Parent then releaseHighlight(char) end end end
+    if not _espAnyActive then
+        if _espWasActive then local players,n=getPlayerSnapshot(); for i=1,n do local p=players[i]; if p then clearPlayerESP(p,p.Character) end end; for char in pairs(_activeHL) do releaseHighlight(char) end; _espWasActive=false end; return
+    end
+    _espWasActive=true
+    local vpHalfX=vpX*0.5; local vpHalfY=vpY*0.5; local camPos2=camCF.Position; local camLook2=camCF.LookVector
+    local myTeam=Config.TeamColorESP and LocalPlayer.Team or nil; local maxDist=Config.MaxDistance; local maxDist2=maxDist*maxDist; local lodDist2=maxDist2*0.36
+    local players,playerCount=getPlayerSnapshot()
+    for i=1,playerCount do
+        local player=players[i]
+        if not player or not player.Parent then clearPlayerESP(player,player and player.Character or nil); continue end
+        local char=player.Character; local cc=char and _getCharCache(char); local hum=cc and cc.hum
+        if not(char and hum and hum.Health>0) then clearPlayerESP(player,char); continue end
+        local isWhitelisted=Config.Whitelist[player.UserId]
+        if isWhitelisted and not Config.ShowWhitelistESP then continue end
+        local root=cc.root; if not root then continue end
+        do
+            local rp=root.Position; local rx=rp.X-camPos2.X; local ry=rp.Y-camPos2.Y; local rz=rp.Z-camPos2.Z; local dist2=rx*rx+ry*ry+rz*rz
+            if dist2>maxDist2 then if _activeCorners[player] then releaseCornerLines(_activeCorners[player]); _activeCorners[player]=nil; _cornerPosCache[player]=nil end; continue end
+            local uid=player.UserId; local slot_=_stateSlot[uid]; local uidMod=slot_ and slot_.uidMod or (uid%3)
+            if dist2>lodDist2 and (espFrameCount+uidMod)%2==1 then continue end
+            local dist=sqrt(dist2); local hp=max(hum.Health,0)/max(hum.MaxHealth,1)
+            local vcached=_visCache[char]; local isVisible=vcached and vcached.vis or false
+            local baseColor=getESPColor(player,myTeam,isWhitelisted)
+            local espColor=(Config.WallCheck and not isVisible) and Config.ESPWallColor or baseColor
+            if char==bestTarget then espColor=_C_LOCK_ESP end
+            local screenRootX,screenRootY,screenRootZ; local boxOK,boxX,boxY,boxW,boxH
+            do
+                local srx,sry,srz,onSc=getVPPoint(root); screenRootX=srx; screenRootY=sry; screenRootZ=srz
+                boxOK,boxX,boxY,boxW,boxH=_esp_updateCorners(player,char,cc,camCF,vpHalfX,vpHalfY,espColor)
+                _esp_updateHealthBar(player,screenRootX,screenRootY,onSc,hp,boxOK,boxX,boxY,boxH)
+                _esp_updateLabels(player,char,uid,uidMod,espColor,screenRootX,screenRootY,onSc,hp,dist,boxOK,boxY)
+                _esp_updateSkeleton(player,char,espColor,camPos2,camLook2)
+                _esp_updateChams(player,char,hp)
+                _esp_updateTracer(player,screenRootX,screenRootY,onSc,espColor,vpY,vpHalfX,vpHalfY)
+                _esp_updateHeadDot(player,char,cc,espColor)
+            end
+        end
+    end
+end
+
+end)()
+
+-- ================================================================
+-- 7. SEGURANÇA / PANIC
+-- ================================================================
+local Unload
+
+-- ===== ADMIN AVOIDANCE SYSTEM - V2 COM COMPORTAMENTO ADAPTATIVO =====
+local _adminBehaviorCache = {}  -- [userId] = {detectedAt, confidence, reason}
+local _lastAdminCheck = 0
+local _adminCheckInterval = 30
+
+local function _isKnownAdmin(userId)
+    -- Verificar lista de admins conhecidos primeiro
+    if Config.AdminIDs and Config.AdminIDs[userId] then
+        return true, "known"
+    end
+    
+    -- Verificar cache com TTL
+    local cached = _adminBehaviorCache[userId]
+    if cached and (tick() - cached.detectedAt) < 60 then
+        if cached.confidence > 0.7 then
+            return true, cached.reason
+        end
+    end
+    
+    return false, nil
+end
+
+local function _checkAdminBehavior(player, char)
+    if not char then return 0 end
+    
+    local score = 0
+    local cc = _getCharCache(char)
+    if not cc or not cc.hum then return 0 end
+    
+    -- 1. Verificar se humanoid é invulnerável (god mode = admin)
+    if cc.hum.MaxHealth > 1000 then score = score + 0.3 end
+    if cc.hum.Health == cc.hum.MaxHealth and cc.hum.MaxHealth > 100 then score = score + 0.2 end
+    
+    -- 2. Verificar badges de admin/mod
+    local humanoidDesc = cc.hum:FindFirstChild("HumanoidDescription")
+    if humanoidDesc and humanoidDesc:IsA("HumanoidDescription") then
+        -- Padrões típicos de admin
+        if humanoidDesc.Head == 18 then score = score + 0.25 end  -- Cabeça diferente
+    end
+    
+    -- 3. Verificar velocidade de movimento suspeita
+    if cc.root and cc.root.AssemblyLinearVelocity then
+        local vel = cc.root.AssemblyLinearVelocity.Magnitude
+        if vel > 200 then score = score + 0.2  -- Velocidade impossível
+        elseif vel > 100 then score = score + 0.1 end
+    end
+    
+    -- 4. Verificar nível de rank em grupos
+    local groupsRanks = player:GetGroupRanks()
+    for groupId, rankId in pairs(groupsRanks) do
+        if rankId >= 250 then score = score + 0.15 end  -- Rank muito alto = admin
+    end
+    
+    return min(score, 1.0)
+end
+
+local function checkAdmins()
+    local now = tick()
+    if now - _lastAdminCheck < _adminCheckInterval then return end
+    _lastAdminCheck = now
+    
+    if next(Config.AdminIDs) == nil then return end
+    if not Unload then return end
+    
+    local players, n = getPlayerSnapshot()
+    for i = 1, n do
+        local p = players[i]
+        if p then
+            local isAdmin, reason = _isKnownAdmin(p.UserId)
+            
+            if not isAdmin then
+                -- Verificar comportamento
+                local behaviorScore = _checkAdminBehavior(p, p.Character)
+                if behaviorScore > 0.6 then
+                    _adminBehaviorCache[p.UserId] = {
+                        detectedAt = now,
+                        confidence = behaviorScore,
+                        reason = "behavior"
+                    }
+                    isAdmin = true
+                    reason = "behavior"
+                end
+            end
+            
+            if isAdmin then
+                notify("⚠️ ADMIN/MOD DETECTADO: " .. p.Name .. " (" .. (reason or "unknown") .. ")", "error", 10)
+                task.delay(0.5, Unload)
+                return
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    while isRunning do
+        task.wait(_adminCheckInterval)
+        checkAdmins()
+    end
+end)
+
+Lib.Connections.AdminCheck = Players.PlayerAdded:Connect(function(player)
+    if Config.AdminIDs and Config.AdminIDs[player.UserId] then
+        notify("🚨 ADMIN ENTROU: " .. player.Name, "error", 10)
+        if Unload then task.delay(0.1, Unload) end
+    end
+end)
+
+-- ================================================================
+-- 8. SAVE / LOAD / PERFIS + UI SETTINGS
+-- ================================================================
+;(function()
+
+local SAVE_KEYS={"FOV","Smooth","HitboxPart","TeamCheck","WallCheck","LockOnVisible","MaxDistance","PredictionEnabled","LagCompensation","TriggerDelay","TriggerbotEnabled","RecoilEnabled","SilentAim","ESPEnabled","ChamEnabled","TracerEnabled","SkeletonEnabled","LabelsEnabled","HealthBarEnabled","CrosshairEnabled","HeadDotEnabled","CrosshairSize","CrosshairGap","FOVMinDist","FOVMaxDist","LockThreshold","LockMaxTime","MaxAngularSpeed","ShowWhitelistESP","TargetHUDEnabled","TriggerIntegrated","BulletSpeed","TracerOrigin","TeamColorESP","ChamHPColor","WeaponProfiles","Profiles","ActiveProfile","FOVSyncVisual","FOVCurve","ScoreWeightFOV","ScoreWeightDist","ScoreWeightHP","SpringSmoothing","SpringDamping","MagnetismEnabled","MagnetismStrength","FlickEnabled","FlickSpeed","FlickReturnSpeed","ShowFOV","OffScreenEnabled","OffScreenSize","WeaponLabelEnabled","DynRCSEnabled","DynRCSStrength","DynRCSMaxSamples","AutoPeekEnabled","AutoPeekDist","AutoPeekSpeed"}
+local PROFILE_FIELDS={"FOV","Smooth","HitboxPart","TeamCheck","WallCheck","LockOnVisible","MaxDistance","PredictionEnabled","LagCompensation","TriggerbotEnabled","TriggerDelay","RecoilEnabled","SilentAim","ESPEnabled","ChamEnabled","TracerEnabled","SkeletonEnabled","LabelsEnabled","HealthBarEnabled","CrosshairEnabled","CrosshairSize","CrosshairGap","MaxAngularSpeed","ShowWhitelistESP","TargetHUDEnabled","TriggerIntegrated","BulletSpeed","TracerOrigin","TeamColorESP","ChamHPColor","LockThreshold","LockMaxTime","FOVSyncVisual","FOVCurve","ScoreWeightFOV","ScoreWeightDist","ScoreWeightHP","ESPColor","ESPWallColor","TracerColor","ChamFillColor","ChamOutlineColor","CrosshairColor"}
+local COLOR_SAVE_KEYS={"ESPColor","ESPWallColor","TracerColor","ChamFillColor","ChamOutlineColor","CrosshairColor"}
+local _SKIP_IN_GENERAL_LOOP={Whitelist=true,PriorityList=true}
+
+local function _serializeColor(c) return{r=floor(c.R*255),g=floor(c.G*255),b=floor(c.B*255)} end
+local function _deserializeColor(v)
+    if type(v)=="table" and type(v.r)=="number" and type(v.g)=="number" and type(v.b)=="number" then
+        return Color3.fromRGB(clamp(floor(v.r),0,255),clamp(floor(v.g),0,255),clamp(floor(v.b),0,255))
+    end; return nil
+end
+
+local function _buildSaveData()
+    local data={}; data._version=CONFIG_VERSION
+    for _,k in ipairs(SAVE_KEYS) do data[k]=Config[k] end
+    for _,k in ipairs(COLOR_SAVE_KEYS) do if typeof(Config[k])=="Color3" then data[k]=_serializeColor(Config[k]) end end
+    data.Whitelist={}; for uid in pairs(Config.Whitelist) do data.Whitelist[#data.Whitelist+1]=uid end
+    data.PriorityList={}; for uid in pairs(Config.PriorityList) do data.PriorityList[#data.PriorityList+1]=uid end
+    data.Keybinds={}; for name,bind in pairs(Config.Keybinds) do if type(bind)=="table" and bind.ktype then data.Keybinds[name]={ktype=bind.ktype,value=bind.value.Name} end end
+    return data
+end
+
+saveConfigSilent=function()
+    if not HAS_FILESYSTEM then return end
+    local data=_buildSaveData()
+    pcall(function() writefile("phantom_config.json",HttpService:JSONEncode(data)); configDirty=false end)
+end
+saveConfig=function()
+    if not isRunning then return end
+    local data=_buildSaveData()
+    if HAS_FILESYSTEM then
+        local ok,err=pcall(function() writefile("phantom_config.json",HttpService:JSONEncode(data)) end)
+        if ok then configDirty=false; notify("Config salva!","success")
+        else notify("Erro ao salvar: "..tostring(err),"error") end
+    else
+        if _genv then _genv[_configGenvKey]=data; notify("Config salva (memória via getgenv)","warn")
+        else Lib._configBackup=data; notify("Config salva (Lib._configBackup)","warn") end
+        configDirty=false
+    end
+end
+
+function Lib._loadConfig()
+    local raw=nil
+    if HAS_FILESYSTEM then local ok,result=pcall(readfile,"phantom_config.json"); if ok then raw=result elseif tostring(result):find("No such file") then notify("Primeira execução — usando padrão","info"); return end end
+    if not raw then local backup=(_genv and _genv[_configGenvKey]) or Lib._configBackup; if backup then local ok2,enc=pcall(HttpService.JSONEncode,HttpService,backup); if ok2 then raw=enc end end end
+    if not raw then notify("Nenhuma config encontrada","info"); return end
+    local ok3,data=pcall(HttpService.JSONDecode,HttpService,raw); if not ok3 then notify("Config corrompida","error"); return end
+    if data._version and data._version<CONFIG_VERSION then notify(sfmt("Config v%d detectada (atual v%d) — migrando campos",data._version,CONFIG_VERSION),"warn",6) end
+    for _,k in ipairs(SAVE_KEYS) do
+        if _SKIP_IN_GENERAL_LOOP[k] then continue end
+        if data[k]~=nil and type(data[k])==type(Config[k]) then local limits=CONFIG_NUM_LIMITS[k]; if limits and type(data[k])=="number" then Config[k]=clamp(data[k],limits[1],limits[2]) else Config[k]=data[k] end end
+    end
+    for _,k in ipairs(COLOR_SAVE_KEYS) do local c=_deserializeColor(data[k]); if c then Config[k]=c end end
+    for _,listKey in ipairs({"Whitelist","PriorityList"}) do Config[listKey]={}; if type(data[listKey])=="table" then for _,id in ipairs(data[listKey]) do Config[listKey][tonumber(id)]=true end end end
+    if type(data.WeaponProfiles)=="table" then
+        local WP_NUM_LIMITS={FOV={10,180},Smooth={1,20},BulletSpeed={0,9999},RecoilY={-1,1},RecoilX={-1,1}}
+        for name,p in pairs(data.WeaponProfiles) do
+            if type(p)=="table" then
+                local valid=true; for field,limits in pairs(WP_NUM_LIMITS) do if p[field]~=nil then if type(p[field])~="number" then valid=false; notify("WeaponProfile '"..tostring(name).."."..field.."' inválido","warn"); break end; p[field]=clamp(p[field],limits[1],limits[2]) end end
+                if valid then Config.WeaponProfiles[name]=p end
+            end
+        end
+    end
+    if type(data.Keybinds)=="table" then
+        for name,bindData in pairs(data.Keybinds) do
+            if type(bindData)=="table" and bindData.ktype and bindData.value then
+                if bindData.ktype=="key" then local ok,kc=pcall(function() return Enum.KeyCode[bindData.value] end); if ok and kc then Config.Keybinds[name]={ktype="key",value=kc} end
+                elseif bindData.ktype=="mouse" then local ok,uit=pcall(function() return Enum.UserInputType[bindData.value] end); if ok and uit then Config.Keybinds[name]={ktype="mouse",value=uit} end end
+            end
+        end
+    end
+    if type(data.Profiles)=="table" then Config.Profiles={}; for profileName,profileData in pairs(data.Profiles) do if type(profileName)=="string" and type(profileData)=="table" then local copy={}; for k,v in pairs(profileData) do copy[k]=v end; Config.Profiles[profileName]=copy end end end
+    if type(data.ActiveProfile)=="string" then Config.ActiveProfile=data.ActiveProfile end
+    if not _FOV_CURVES[Config.FOVCurve] then notify("FOVCurve inválido '"..tostring(Config.FOVCurve).."' → reset para Sqrt","warn"); Config.FOVCurve="Sqrt" end
+    _updateSmoothCache(); _updateESPAnyActive(); _updateScoreWeightCache()
+    notify("Config carregada!","success"); Lib._updateAllUI()
+end
+
+local function saveCurrentAsProfile(profileName)
+    if not profileName or profileName=="" then notify("Nome inválido","error"); return end
+    Config.Profiles=Config.Profiles or {}; local snap={}
+    for _,f in ipairs(PROFILE_FIELDS) do local v=Config[f]; if typeof(v)=="Color3" then snap[f]=_serializeColor(v) else snap[f]=v end end
+    Config.Profiles[profileName]=snap; Config.ActiveProfile=profileName; Lib._profileLabel(); saveConfig()
+    notify("Perfil salvo: "..profileName,"success")
+end
+
+function Lib._loadProfile(profileName)
+    local profile=Config.Profiles and Config.Profiles[profileName]; if not profile then notify("Perfil não encontrado: "..profileName,"error"); return end
+    for _,f in ipairs(PROFILE_FIELDS) do
+        if profile[f]~=nil then local v=profile[f]; local asColor=_deserializeColor(v)
+            if asColor then Config[f]=asColor elseif typeof(Config[f])~="Color3" and type(v)==type(Config[f]) then local limits=CONFIG_NUM_LIMITS[f]; if limits and type(v)=="number" then Config[f]=clamp(v,limits[1],limits[2]) else Config[f]=v end end
+        end
+    end
+    Config.ActiveProfile=profileName; _lastAimFov=-1; _lastFovDisplay=-1; _fovDirty_vis=nil
+    _updateSmoothCache(); _updateESPAnyActive(); _updateScoreWeightCache()
+    Lib._fovCircle(); Lib._xhair(); Lib._updateAllUI(); Lib._profileLabel(); notify("Perfil: "..profileName,"success")
+end
+
+local function deleteProfile(profileName)
+    if not Config.Profiles or not Config.Profiles[profileName] then return end
+    Config.Profiles[profileName]=nil; if Config.ActiveProfile==profileName then Config.ActiveProfile=nil; Lib._profileLabel() end
+    saveConfig(); notify("Perfil deletado: "..profileName,"warn")
+end
+local function getProfileNames() local names={}; for name in pairs(Config.Profiles or {}) do names[#names+1]=name end; table.sort(names); return names end
+
+local profileDropdownBtn=nil; local profileDropdownList=nil
+local _profileListVersion=0; local _lastBuiltVersion=-1
+local function _markProfilesDirty() _profileListVersion=_profileListVersion+1 end
+local function rebuildProfileDropdown()
+    if _lastBuiltVersion==_profileListVersion then return end; _lastBuiltVersion=_profileListVersion
+    if not profileDropdownList then return end
+    for _,c in ipairs(profileDropdownList:GetChildren()) do if not c:IsA("UIListLayout") then c:Destroy() end end
+    local names=getProfileNames(); profileDropdownList.Size=UDim2.new(0.56,0,0,#names*26)
+    for i,name in ipairs(names) do
+        local ob=Instance.new("TextButton",profileDropdownList); ob.Size=UDim2.new(1,0,0,26); ob.BackgroundTransparency=1
+        ob.TextColor3=COLORS.text_main; ob.TextSize=12; ob.Font=Enum.Font.Gotham; ob.Text=name; ob.LayoutOrder=i
+        local twH=TweenService:Create(ob,TI_FAST,{BackgroundTransparency=0,BackgroundColor3=COLORS.bg_hover}); local twL=TweenService:Create(ob,TI_FAST,{BackgroundTransparency=1})
+        ob.MouseEnter:Connect(function() twH:Play() end); ob.MouseLeave:Connect(function() twL:Play() end)
+        ob.MouseButton1Click:Connect(function() Lib._loadProfile(name); if profileDropdownBtn then profileDropdownBtn.Text=name.." ▾" end; profileDropdownList.Visible=false end)
+    end
+end
+
+local function makeSep(parent,label)
+    Instance.new("Frame",parent).Size=UDim2.new(1,0,0,1)
+    if label then local sl=Instance.new("TextLabel",parent); sl.Size=UDim2.new(1,0,0,20); sl.BackgroundTransparency=1; sl.TextColor3=COLORS.text_sub; sl.TextSize=11; sl.Font=Enum.Font.GothamMedium; sl.Text=label; sl.TextXAlignment=Enum.TextXAlignment.Left end
+end
+
+do
+    makeSep(SettingsFrame,"PERFIS")
+    local pdRow=Instance.new("Frame",SettingsFrame); pdRow.Size=UDim2.new(1,0,0,36); pdRow.BackgroundTransparency=1; pdRow.ClipsDescendants=false
+    local pdLbl=Instance.new("TextLabel",pdRow); pdLbl.Size=UDim2.new(0.4,0,0,36); pdLbl.BackgroundTransparency=1
+    pdLbl.TextColor3=COLORS.text_main; pdLbl.TextSize=13; pdLbl.Font=Enum.Font.GothamMedium; pdLbl.Text="Perfil Ativo"; pdLbl.TextXAlignment=Enum.TextXAlignment.Left
+    profileDropdownBtn=Instance.new("TextButton",pdRow); profileDropdownBtn.Size=UDim2.new(0.56,0,0,26); profileDropdownBtn.Position=UDim2.new(0.44,0,0.5,-13)
+    profileDropdownBtn.BackgroundColor3=COLORS.bg_card; profileDropdownBtn.TextColor3=COLORS.accent; profileDropdownBtn.TextSize=12; profileDropdownBtn.Font=Enum.Font.GothamMedium
+    profileDropdownBtn.Text=(Config.ActiveProfile or "Selecionar").." ▾"; profileDropdownBtn.BorderSizePixel=0
+    Instance.new("UICorner",profileDropdownBtn).CornerRadius=UDim.new(0,4)
+    profileDropdownList=Instance.new("Frame",pdRow); profileDropdownList.Size=UDim2.new(0.56,0,0,0); profileDropdownList.Position=UDim2.new(0.44,0,0,36)
+    profileDropdownList.BackgroundColor3=COLORS.bg_card; profileDropdownList.BorderSizePixel=0; profileDropdownList.Visible=false; profileDropdownList.ZIndex=20
+    Instance.new("UICorner",profileDropdownList).CornerRadius=UDim.new(0,4); Instance.new("UIListLayout",profileDropdownList).SortOrder=Enum.SortOrder.LayoutOrder
+    profileDropdownBtn.MouseButton1Click:Connect(function() rebuildProfileDropdown(); profileDropdownList.Visible=not profileDropdownList.Visible end)
+    local newRow=Instance.new("Frame",SettingsFrame); newRow.Size=UDim2.new(1,0,0,36); newRow.BackgroundTransparency=1
+    local nameBox=Instance.new("TextBox",newRow); nameBox.Size=UDim2.new(0.6,0,0,26); nameBox.Position=UDim2.new(0,0,0.5,-13)
+    nameBox.BackgroundColor3=COLORS.bg_card; nameBox.TextColor3=COLORS.text_main; nameBox.PlaceholderText="Nome do perfil..."; nameBox.PlaceholderColor3=COLORS.text_sub
+    nameBox.TextSize=12; nameBox.Font=Enum.Font.Gotham; nameBox.Text=""; nameBox.BorderSizePixel=0
+    Instance.new("UICorner",nameBox).CornerRadius=UDim.new(0,4)
+    local saveProfileBtn=Instance.new("TextButton",newRow); saveProfileBtn.Size=UDim2.new(0.18,-4,0,26); saveProfileBtn.Position=UDim2.new(0.62,4,0.5,-13)
+    saveProfileBtn.BackgroundColor3=COLORS.green; saveProfileBtn.TextColor3=_C_WHITE; saveProfileBtn.TextSize=11; saveProfileBtn.Font=Enum.Font.GothamBold; saveProfileBtn.Text="Salvar"; saveProfileBtn.BorderSizePixel=0
+    Instance.new("UICorner",saveProfileBtn).CornerRadius=UDim.new(0,4)
+    local delProfileBtn=Instance.new("TextButton",newRow); delProfileBtn.Size=UDim2.new(0.18,-4,0,26); delProfileBtn.Position=UDim2.new(0.82,0,0.5,-13)
+    delProfileBtn.BackgroundColor3=COLORS.red; delProfileBtn.TextColor3=_C_WHITE; delProfileBtn.TextSize=11; delProfileBtn.Font=Enum.Font.GothamBold; delProfileBtn.Text="Deletar"; delProfileBtn.BorderSizePixel=0
+    Instance.new("UICorner",delProfileBtn).CornerRadius=UDim.new(0,4)
+    saveProfileBtn.MouseButton1Click:Connect(function() local name=nameBox.Text:match("^%s*(.-)%s*$"); if name~="" then saveCurrentAsProfile(name); _markProfilesDirty(); rebuildProfileDropdown(); profileDropdownBtn.Text=name.." ▾" end end)
+    delProfileBtn.MouseButton1Click:Connect(function() local name=Config.ActiveProfile; if name then deleteProfile(name); _markProfilesDirty(); rebuildProfileDropdown(); profileDropdownBtn.Text="Selecionar ▾" end end)
+    local saveCfgBtn=Instance.new("TextButton",SettingsFrame); saveCfgBtn.Size=UDim2.new(1,0,0,32); saveCfgBtn.BackgroundColor3=COLORS.green
+    saveCfgBtn.TextColor3=_C_WHITE; saveCfgBtn.TextSize=13; saveCfgBtn.Font=Enum.Font.GothamBold; saveCfgBtn.Text="💾  Salvar Config"; saveCfgBtn.BorderSizePixel=0
+    Instance.new("UICorner",saveCfgBtn).CornerRadius=UDim.new(0,4); saveCfgBtn.MouseButton1Click:Connect(function() pcall(saveConfig) end)
+
+    -- EXPORTAR / IMPORTAR CONFIG POR STRING
+    makeSep(SettingsFrame,"EXPORTAR / IMPORTAR")
+    local expBox=Instance.new("TextBox",SettingsFrame); expBox.Size=UDim2.new(1,0,0,36)
+    expBox.BackgroundColor3=COLORS.bg_card; expBox.TextColor3=COLORS.accent; expBox.TextSize=11; expBox.Font=Enum.Font.Code
+    expBox.PlaceholderText="String de config (base64)..."; expBox.PlaceholderColor3=COLORS.text_sub
+    expBox.Text=""; expBox.BorderSizePixel=0; expBox.ClearTextOnFocus=false
+    Instance.new("UICorner",expBox).CornerRadius=UDim.new(0,4)
+    
+    local expRow=Instance.new("Frame",SettingsFrame); expRow.Size=UDim2.new(1,0,0,32); expRow.BackgroundTransparency=1
+    local expBtn=Instance.new("TextButton",expRow); expBtn.Size=UDim2.new(0.48,0,1,0); expBtn.BackgroundColor3=COLORS.accent
+    expBtn.TextColor3=_C_WHITE; expBtn.TextSize=12; expBtn.Font=Enum.Font.GothamBold; expBtn.Text="📤 Exportar"; expBtn.BorderSizePixel=0
+    Instance.new("UICorner",expBtn).CornerRadius=UDim.new(0,4)
+    
+    local impBtn=Instance.new("TextButton",expRow); impBtn.Size=UDim2.new(0.48,0,1,0); impBtn.Position=UDim2.new(0.52,0,0,0)
+    impBtn.BackgroundColor3=COLORS.yellow; impBtn.TextColor3=Color3.fromRGB(20,20,20); impBtn.TextSize=12; impBtn.Font=Enum.Font.GothamBold; impBtn.Text="📥 Importar"; impBtn.BorderSizePixel=0
+    Instance.new("UICorner",impBtn).CornerRadius=UDim.new(0,4)
+    
+    expBtn.MouseButton1Click:Connect(function()
+        local ok,json=pcall(function() return HttpService:JSONEncode(_buildSaveData()) end)
+        if not ok then notify("Erro ao exportar","error"); return end
+        local b64chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        local result={}; local bytes={json:byte(1,-1)}; local i=1
+        while i<=#bytes do
+            local b1=bytes[i] or 0; local b2=bytes[i+1] or 0; local b3=bytes[i+2] or 0
+            local n=b1*65536+b2*256+b3
+            result[#result+1]=b64chars:sub(floor(n/262144)%64+1,floor(n/262144)%64+1)
+            result[#result+1]=b64chars:sub(floor(n/4096)%64+1,floor(n/4096)%64+1)
+            result[#result+1]=bytes[i+1] and b64chars:sub(floor(n/64)%64+1,floor(n/64)%64+1) or "="
+            result[#result+1]=bytes[i+2] and b64chars:sub(n%64+1,n%64+1) or "="
+            i=i+3
+        end
+        expBox.Text=table.concat(result); notify("Config exportada! Copie a string.","success",5)
+    end)
+    impBtn.MouseButton1Click:Connect(function()
+        local b64=expBox.Text:match("^%s*(.-)%s*$"); if not b64 or b64=="" then notify("Cole uma string first","warn"); return end
+        local b64chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        local lookup={}; for i=1,#b64chars do lookup[b64chars:sub(i,i)]=i-1 end
+        local bytes={}; local i=1
+        while i<=#b64 do
+            local c1=lookup[b64:sub(i,i)]; local c2=lookup[b64:sub(i+1,i+1)]
+            local c3=lookup[b64:sub(i+2,i+2)] or 0; local c4=lookup[b64:sub(i+3,i+3)] or 0
+            if not c1 or not c2 then break end
+            local n=(c1 or 0)*262144+(c2 or 0)*4096+(c3 or 0)*64+(c4 or 0)
+            bytes[#bytes+1]=floor(n/65536)%256
+            if c3>0 then bytes[#bytes+1]=floor(n/256)%256 end
+            if c4>0 then bytes[#bytes+1]=n%256 end
+            i=i+4
+        end
+        if #bytes==0 then notify("String base64 inválida (vazia)","error"); return end
+        local json=string.char(table.unpack(bytes))
+        local okJ,data=pcall(HttpService.JSONDecode,HttpService,json)
+        if not okJ or type(data)~="table" then notify("String inválida — JSON corrompido","error"); return end
+        local _prevBackup=Lib._configBackup
+        Lib._configBackup=data
+        local _prevGenv=_genv and _genv[_configGenvKey]
+        if _genv then _genv[_configGenvKey]=data end
+        local _prevHasFS=HAS_FILESYSTEM; HAS_FILESYSTEM=false
+        pcall(Lib._loadConfig)
+        HAS_FILESYSTEM=_prevHasFS
+        Lib._configBackup=_prevBackup
+        if _genv then _genv[_configGenvKey]=_prevGenv end
+        notify("Config importada com sucesso!","success")
+    end)
+
+-- ================================================================
+-- 9. LISTENERS DE INPUT
+-- ================================================================
+local panicTimer=0
+Lib.Connections.KeybindMain=UserInputService.InputBegan:Connect(function(input,gp)
+    local kb=Config.Keybinds
+    if Lib._inputMatch(input,kb.MenuOpen) then if isMenuOpen then Lib._closeMenu() else Lib._openMenu() end; return end
+    if gp then return end
+    -- Flick: ativado pela FlickKey (padrão Mouse1), independente do aimbot
+    if Config.FlickEnabled and _flickState=="idle" and Lib._inputMatch(input,kb.FlickKey) then
+        local camCF=Camera.CFrame; local vp=Camera.ViewportSize
+        _flickStart(camCF,vp.X,vp.Y)
+        if _flickState~="idle" then return end  -- consumir input só se flick iniciou (havia alvo)
+    end
+    if Lib._inputMatch(input,kb.AimbotKey) then
+        if Config.AimbotMode=="Toggle" then Config.AimbotEnabled=not Config.AimbotEnabled; notify("Aimbot: "..(Config.AimbotEnabled and "ON" or "OFF"),Config.AimbotEnabled and "success" or "info"); _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot()
+        else isHoldingAim=true; Config.AimbotEnabled=true; _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot(); notify("Aimbot Hold: segurando "..Lib._bindName(kb.AimbotKey),"info",1.5) end
+    elseif Lib._inputMatch(input,kb.ESPKey) then Config.ESPEnabled=not Config.ESPEnabled; _updateESPAnyActive(); notify("ESP: "..(Config.ESPEnabled and "ON" or "OFF"),Config.ESPEnabled and "success" or "info"); Lib._statusDot()
+    elseif Lib._inputMatch(input,kb.ReleaseLock) then if bestTarget then bestTarget=nil; bestAimPart=nil; bestTargetRoot=nil; _bestTargetLockStart=0; notify("Lock liberado manualmente","info",2) end
+    elseif Config.AutoPeekEnabled and Lib._inputMatch(input,kb.PeekKey) then _peekStart()
+    elseif Lib._inputMatch(input,kb.Panic) then panicTimer=tick() end
+end)
+Lib.Connections.KeybindEnd=UserInputService.InputEnded:Connect(function(input)
+    local kb=Config.Keybinds
+    if Config.AimbotMode=="Hold" and Lib._inputMatch(input,kb.AimbotKey) then
+        isHoldingAim=false; Config.AimbotEnabled=false; bestAimPart=nil
+        if Config.SilentAim or prevSilent then Lib._disableSA(); Config.SilentAim=prevSilent; prevSilent=false end
+        bestTarget=nil; _bestTargetLockStart=0; _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot()
+    elseif Lib._inputMatch(input,kb.Panic) then
+        if panicTimer>0 and tick()-panicTimer>=1.5 then notify("Panic Mode ativado!","error"); if Unload then task.delay(0.2,Unload) end end; panicTimer=0
+    end
+end)
+
+-- ================================================================
+-- 10. UNLOAD
+-- ================================================================
+local _unloadCalled=false
+Unload=function()
+    if _unloadCalled then return end; _unloadCalled=true; isRunning=false
+    if _fovAnimThread then pcall(task.cancel,_fovAnimThread); _fovAnimThread=nil end
+    if _toolChildConn then pcall(function() _toolChildConn:Disconnect() end); _toolChildConn=nil end
+    for _,conn in pairs(Lib.Connections) do if typeof(conn)=="RBXScriptConnection" then pcall(function() conn:Disconnect() end) end end
+    for _,conn in pairs(diedConnections) do pcall(function() conn:Disconnect() end) end
+    tbl_clear(Lib.Connections); _clearWeakTable(diedConnections)
+    for _,obj in pairs(Lib.Drawings) do pcall(function() obj:Remove() end) end; tbl_clear(Lib.Drawings)
+    for _,obj in ipairs(Lib.AllPoolDrawings) do pcall(function() obj:Remove() end) end; tbl_clear(Lib.AllPoolDrawings)
+    tbl_clear(Lib.ESPPool); tbl_clear(Lib.ActiveESP); tbl_clear(Lib.TracerPool); tbl_clear(Lib.ActiveTracers)
+    tbl_clear(Lib.SkeletonPool); tbl_clear(Lib.CornerPool); tbl_clear(Lib.LabelPool); tbl_clear(Lib.ActiveSkeleton)
+    tbl_clear(Lib.ActiveCorners); tbl_clear(Lib.ActiveLabels); tbl_clear(Lib.ActiveHB); tbl_clear(Lib.HBPool)
+    tbl_clear(Lib.HeadDotPool); tbl_clear(Lib.ActiveHeadDots)
+    for _,h in pairs(Lib.ActiveHighlights) do pcall(function() h.Enabled=false; h:Destroy() end) end
+    for _,h in ipairs(Lib.HighlightPool) do pcall(function() h:Destroy() end) end
+    tbl_clear(Lib.ActiveHighlights); tbl_clear(Lib.HighlightPool); highlightCount=0
+    for k,v in pairs(_vpCache) do _vpEntryPool[#_vpEntryPool+1]=v; _vpCache[k]=nil end; tbl_clear(_vpEntryPool)
+    _visLastChar=nil; _floorLastChar=nil; Lib._disableSA(); _flickReset(); _peekReset(); _rcsClearPattern()
+    if _rcsToolConn then pcall(function() _rcsToolConn:Disconnect() end); _rcsToolConn=nil end
+    pcall(function() _osArrow:Remove() end); pcall(function() _osArrowOutline:Remove() end)
+    pcall(function() if ScreenGui and ScreenGui.Parent then ScreenGui:Destroy() end end)
+    bestTarget=nil; bestAimPart=nil; bestTargetRoot=nil; bestTargetState=nil; tbl_clear(_stateSlot)
+    _clearWeakTable(_visCache); _clearWeakTable(_boneCache)
+    for _,conn in pairs(_boneCacheConns) do pcall(function() conn:Disconnect() end) end; tbl_clear(_boneCacheConns)
+    _clearWeakTable(_charCache)
+    for _,conn in pairs(_charCacheConns) do pcall(function() conn:Disconnect() end) end; tbl_clear(_charCacheConns)
+    _clearWeakTable(_inVehicleCache); _clearWeakTable(_charToPlayer)
+    for _,conns in pairs(_inVehicleEventConns) do pcall(function() conns[1]:Disconnect() end); pcall(function() conns[2]:Disconnect() end) end; tbl_clear(_inVehicleEventConns)
+    tbl_clear(notifQueue); notifHead=1; notifTail=0; tbl_clear(_playerListCache); tbl_clear(_playerSet); tbl_clear(_transparentSet)
+    tbl_clear(_tracerToX); tbl_clear(_tracerToY)
+    -- FIX: desconectar _recoilConn explicitamente — pode estar ativo se unload ocorrer durante disparo
+    if _recoilConn then pcall(function() _recoilConn:Disconnect() end); _recoilConn=nil end
+    print("PHANTOM HUB: Unload completo. (v3.2 — 88 fixes/melhorias aplicadas)")
+end
+
+-- ================================================================
+-- 9. LISTENERS DE INPUT
+-- ================================================================
+local panicTimer=0
+Lib.Connections.KeybindMain=UserInputService.InputBegan:Connect(function(input,gp)
+    local kb=Config.Keybinds
+    if Lib._inputMatch(input,kb.MenuOpen) then if isMenuOpen then Lib._closeMenu() else Lib._openMenu() end; return end
+    if gp then return end
+    -- Flick: ativado pela FlickKey (padrão Mouse1), independente do aimbot
+    if Config.FlickEnabled and _flickState=="idle" and Lib._inputMatch(input,kb.FlickKey) then
+        local camCF=Camera.CFrame; local vp=Camera.ViewportSize
+        _flickStart(camCF,vp.X,vp.Y)
+        if _flickState~="idle" then return end  -- consumir input só se flick iniciou (havia alvo)
+    end
+    if Lib._inputMatch(input,kb.AimbotKey) then
+        if Config.AimbotMode=="Toggle" then Config.AimbotEnabled=not Config.AimbotEnabled; notify("Aimbot: "..(Config.AimbotEnabled and "ON" or "OFF"),Config.AimbotEnabled and "success" or "info"); _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot()
+        else isHoldingAim=true; Config.AimbotEnabled=true; _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot(); notify("Aimbot Hold: segurando "..Lib._bindName(kb.AimbotKey),"info",1.5) end
+    elseif Lib._inputMatch(input,kb.ESPKey) then Config.ESPEnabled=not Config.ESPEnabled; _updateESPAnyActive(); notify("ESP: "..(Config.ESPEnabled and "ON" or "OFF"),Config.ESPEnabled and "success" or "info"); Lib._statusDot()
+    elseif Lib._inputMatch(input,kb.ReleaseLock) then if bestTarget then bestTarget=nil; bestAimPart=nil; bestTargetRoot=nil; _bestTargetLockStart=0; notify("Lock liberado manualmente","info",2) end
+    elseif Config.AutoPeekEnabled and Lib._inputMatch(input,kb.PeekKey) then _peekStart()
+    elseif Lib._inputMatch(input,kb.Panic) then panicTimer=tick() end
+end)
+Lib.Connections.KeybindEnd=UserInputService.InputEnded:Connect(function(input)
+    local kb=Config.Keybinds
+    if Config.AimbotMode=="Hold" and Lib._inputMatch(input,kb.AimbotKey) then
+        isHoldingAim=false; Config.AimbotEnabled=false; bestAimPart=nil
+        if Config.SilentAim or prevSilent then Lib._disableSA(); Config.SilentAim=prevSilent; prevSilent=false end
+        bestTarget=nil; _bestTargetLockStart=0; _fovDirty_vis=nil; Lib._fovCircle(); Lib._statusDot()
+    elseif Lib._inputMatch(input,kb.Panic) then
+        if panicTimer>0 and tick()-panicTimer>=1.5 then notify("Panic Mode ativado!","error"); if Unload then task.delay(0.2,Unload) end end; panicTimer=0
+    end
+end)
+
+-- ================================================================
+-- 10. DEBUG E MÉTRICAS
+-- ================================================================
+local LogLevel={INFO=1,WARN=2,ERROR=3}
+local function log(msg,level)
+    level=level or LogLevel.INFO; if level<LogLevel.WARN and not Config.DebugMode then return end
+    local prefix=level==LogLevel.ERROR and "[ERRO] " or level==LogLevel.WARN and "[AVISO] " or "[INFO] "
+    local ntype=level==LogLevel.ERROR and "error" or level==LogLevel.WARN and "warn" or "info"
+    notify(prefix..tostring(msg or ""),ntype)
+end
+task.spawn(function()
+    while isRunning do
+        task.wait(0.5); if not Config.DebugMode or not Lib then continue end
+        local espPool=#(Lib.ESPPool or {}); local corrPool=#(Lib.CornerPool or {}); local trkPool=#(Lib.TracerPool or {})
+        local vp=Camera.ViewportSize; local aspectName=_detectAspectName and _detectAspectName(vp.X,vp.Y) or "N/A"
+        local targetName=bestTarget and (_charToPlayer[bestTarget] or {DisplayName="?"}).DisplayName or "nenhum"
+        log(sfmt("Pools ESP:%d Corner:%d Tracer:%d | HL:%d/%d | Alvo:%s | Res:%s | Players:%d | FC:%d | VPPool:%d",espPool,corrPool,trkPool,highlightCount,MAX_HIGHLIGHTS,targetName,aspectName,#_playerListCache,_frameCount%10000,#_vpEntryPool),LogLevel.INFO)
+        if espPool<5 then log("Pool ESP baixo: "..espPool,LogLevel.WARN) end
+        if corrPool<8 then log("Pool Corner baixo: "..corrPool,LogLevel.WARN) end
+        if highlightCount>=MAX_HIGHLIGHTS-2 then log("Limite de Highlights próximo!",LogLevel.WARN) end
+    end
+end)
+
+-- ================================================================
+-- 11. INICIALIZAÇÃO FINAL
+-- ================================================================
+task.spawn(function() while isRunning do task.wait(60); if not isRunning then break end; if configDirty and HAS_FILESYSTEM then pcall(saveConfigSilent) end end end)
+
+Lib._loadConfig()
+if Config.ActiveProfile and Config.Profiles[Config.ActiveProfile] then Lib._loadProfile(Config.ActiveProfile) end
+checkAdmins(); _fovDirty_vis=nil
+Lib._fovCircle(); Lib._xhair(); Lib._profileLabel(); Lib._statusDot()
+_updateESPAnyActive(); _updateSmoothCache()
+for _,p in ipairs(Players:GetPlayers()) do Lib._playerEntry(p) end
+notify("PHANTOM HUB carregado!","success",4)
+notify("RShift:menu  V:aimbot  J:ESP  X:soltar lock  Del 1.5s:panic","info",7)
+end)()
