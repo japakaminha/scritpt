@@ -291,7 +291,9 @@ local _dummySingleton=setmetatable({},_dummyMeta)
 local function makeDummyDrawing() return _dummySingleton end
 local function makeDrawing(dtype,props,isPoolDrawing)
     if not HAS_DRAWING then return makeDummyDrawing() end
-    local d=Drawing.new(dtype); d.Visible=false
+    local ok,d=pcall(function() return Drawing.new(dtype) end)
+    if not ok or not d then return makeDummyDrawing() end
+    d.Visible=false
     if props then pcall(function() for k,v in pairs(props) do d[k]=v end end) end
     if isPoolDrawing then Lib.AllPoolDrawings[#Lib.AllPoolDrawings+1]=d else Lib.Drawings[#Lib.Drawings+1]=d end
     return d
