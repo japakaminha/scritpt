@@ -1,15 +1,18 @@
--- ============
--- PHANTOM HUB 
--- ============
+-- ================================================================
+-- PHANTOM HUB v3.2
+-- ================================================================
+-- 1. CORE
+-- 2. AUDITORIA TÉCNICA
+-- ================================================================
 local clamp = math.clamp or function(v, lo, hi) return v < lo and lo or v > hi and hi or v end
 local task = task or {
     spawn=function(f,...) local co=coroutine.wrap(f); co(...); return co end,
-    wait=function(t) return wait(t or 0) end,
+    wait=function(t) local s=os.clock(); repeat until os.clock()-s>=(t or 0) end,  -- FIX-06: não depende do wait() global
     delay=function(t,f,...) delay(t,f,...) end,
     cancel=function() end,
     defer=function(f,...) local co=coroutine.wrap(f); co(...); return co end,
 }
-local tbl_clear = table.clear or function(t) for k in next,t do t[k]=nil end end
+local tbl_clear = table.clear or function(t) for k in next,t do rawset(t,k,nil) end end  -- FIX-07: rawset seguro para metatables
 
 local HAS_DRAWING=false
 do
@@ -90,6 +93,8 @@ local _charToPlayer=setmetatable({},{__mode="k"}); local _charCacheConns=setmeta
 local _boneCacheConns=setmetatable({},{__mode="k"})
 local _inVehicleEventConns={}; local _playerVehicleChar={}
 local _stateSlot={}; local _chamHPCache={}; local _labelPosCache={}; local _skelColorCache={}
+local _weaponCache={}  -- [player] = toolName; atualizado via ChildAdded/ChildRemoved do char
+local _tracerToX={}; local _tracerToY={}; local _tracerFromCache={}
 
 local _CRITICAL_CHAR_PARTS={HumanoidRootPart=true,Head=true,UpperTorso=true,Torso=true,LeftUpperArm=true,["Left Arm"]=true,RightUpperArm=true,["Right Arm"]=true}
 
@@ -105,24 +110,29 @@ local function getVPPoint(part)
 end
 
 local function _buildCharCache(char)
-    local c=_charCache[char]
-    if not c then
-        c={}; _charCache[char]=c
-        local old=_charCacheConns[char]; if old then pcall(function() old:Disconnect() end) end
-        local ok,conn=pcall(function()
-            return char.ChildRemoved:Connect(function(child)
-                if _CRITICAL_CHAR_PARTS[child.Name] or child:IsA("Humanoid") then _charCache[char]=nil end
-            end)
+    -- FIX: validar char e char.Parent antes de qualquer acesso
+    if not char or not char.Parent then return nil end
+    local hum=char:FindFirstChild("Humanoid"); local root=char:FindFirstChild("HumanoidRootPart"); local head=char:FindFirstChild("Head")
+    if not hum or not root or not head then return nil end
+    local c={hum=hum,root=root,head=head,char=char}
+    local old=_charCacheConns[char]; if old then pcall(function() old:Disconnect() end) end
+    local ok,conn=pcall(function()
+        return char.ChildRemoved:Connect(function(child)
+            if _CRITICAL_CHAR_PARTS[child.Name] or child:IsA("Humanoid") then _charCache[char]=nil end
         end)
-        if ok and conn then _charCacheConns[char]=conn end
-    end
+    end)
+    if ok and conn then _charCacheConns[char]=conn end
     local isR15=char:FindFirstChild("UpperTorso")~=nil
-    c.hum=char:FindFirstChild("Humanoid"); c.root=char:FindFirstChild("HumanoidRootPart"); c.head=char:FindFirstChild("Head")
     if isR15 then c.torso=char:FindFirstChild("UpperTorso"); c.lShoulder=char:FindFirstChild("LeftUpperArm"); c.rShoulder=char:FindFirstChild("RightUpperArm")
     else c.torso=char:FindFirstChild("Torso"); c.lShoulder=char:FindFirstChild("Left Arm"); c.rShoulder=char:FindFirstChild("Right Arm") end
+    _charCache[char]=c
     return c
 end
-local function _getCharCache(char) return _charCache[char] or _buildCharCache(char) end
+local function _getCharCache(char)
+    -- FIX: validar char.Parent antes de retornar cache
+    if not char or not char.Parent then return nil end
+    return _charCache[char] or _buildCharCache(char)
+end
 
 local _wallFilter={}; local _wallFilterDirty=true; local configDirty=false
 local _playerListCache={}; local _playerSet={}; local _playerListNeedsCompact=false; local _playerListDirty=true
@@ -220,7 +230,7 @@ task.spawn(function()
         if notifHead>notifTail then continue end
         if activeNotifCount>=NOTIF_MAX_SCREEN then continue end
         local item=notifQueue[notifHead]; notifQueue[notifHead]=nil; notifHead=notifHead+1
-        if notifHead>notifTail then for i=notifHead,notifTail do notifQueue[i]=nil end; notifHead=1; notifTail=0 end
+        if notifHead>notifTail then notifHead=1; notifTail=0 end  -- FIX: não iterar de head a tail ao resetar (já nil-ados)
         local displayMsg=item.msg; if item.count and item.count>1 then displayMsg=item.msg.." (x"..item.count..")" end
         activeNotifCount=activeNotifCount+1; notifOrderCount=notifOrderCount+1
         local ok=pcall(function()
@@ -254,7 +264,9 @@ local _dummySingleton=setmetatable({},_dummyMeta)
 local function makeDummyDrawing() return _dummySingleton end
 local function makeDrawing(dtype,props,isPoolDrawing)
     if not HAS_DRAWING then return makeDummyDrawing() end
-    local d=Drawing.new(dtype); d.Visible=false
+    local ok,d=pcall(function() return Drawing.new(dtype) end)
+    if not ok or not d then return makeDummyDrawing() end
+    d.Visible=false
     if props then pcall(function() for k,v in pairs(props) do d[k]=v end end) end
     if isPoolDrawing then Lib.AllPoolDrawings[#Lib.AllPoolDrawings+1]=d else Lib.Drawings[#Lib.Drawings+1]=d end
     return d
@@ -301,8 +313,9 @@ end
 local _skelLineScratch={}
 local function getSkeletonLines(count)
     local pool=_poolSkel
-    for i=1,count do local n=#pool; if n>0 then _skelLineScratch[i]=pool[n]; pool[n]=nil else _skelLineScratch[i]=makeDrawing("Line",{},true) end end
-    for i=count+1,#_skelLineScratch do _skelLineScratch[i]=nil end; return _skelLineScratch
+    local lines={}
+    for i=1,count do local n=#pool; if n>0 then lines[i]=pool[n]; pool[n]=nil else lines[i]=makeDrawing("Line",{},true) end end
+    return lines
 end
 local function releaseSkeletonLines(lines)
     local pool=_poolSkel
@@ -452,7 +465,7 @@ end)
 Lib.Connections[#Lib.Connections+1]=_tooltipMoveConn
 
 local function showTooltip(text,mx,my)
-    TooltipLabel.Text=text; local tipW=#text*6+12; local tipH=22
+    TooltipLabel.Text=text; local tipW=math.min(#text*7+16, 300); local tipH=22  -- FIX: cap em 300px, evita overflow com unicode
     TooltipFrame.Size=UDim2.new(0,tipW,0,tipH)
     local vp=Camera.ViewportSize
     local tx=(mx+14+tipW>vp.X) and (mx-tipW-6) or (mx+14)
@@ -516,7 +529,8 @@ local function switchTab(name)
         local old=Tabs[activeTab]; old.Frame.Visible=false
         TweenService:Create(old.Button,TI_MED,{BackgroundColor3=Color3.fromRGB(0,0,0),BackgroundTransparency=1}):Play()
     end
-    local new=Tabs[name]; new.Frame.Visible=true
+    local new=Tabs[name]; if not new then return end  -- FIX: guard contra tab inválida
+    new.Frame.Visible=true
     TweenService:Create(new.Button,TI_MED,{BackgroundColor3=COLORS.accent,BackgroundTransparency=0}):Play()
     activeTab=name
 end
@@ -804,7 +818,7 @@ function Lib._fovCircle(targetDist)
     local fovDisplay=Config.FOV
     if targetDist then
         if Config.FOVSyncVisual then fovDisplay=Lib._getEffFov(targetDist,bestTargetState)
-        else local t=clamp((targetDist-Config.FOVMinDist)/(Config.FOVMaxDist-Config.FOVMinDist),0,1); fovDisplay=max(Config.FOV*(1-_fovCurveFactor(t)*0.75),5) end
+        else local _fRange=Config.FOVMaxDist-Config.FOVMinDist; local t=_fRange~=0 and clamp((targetDist-Config.FOVMinDist)/_fRange,0,1) or 0; fovDisplay=max(Config.FOV*(1-_fovCurveFactor(t)*0.75),5) end
     end
     local aspectRatio=vpX/vpY
     if fovDisplay~=_lastFovDisplay or vpY~=_lastFovCircleVpY or vpX~=_lastFovCircleVpX or aspectRatio~=_lastAspectRatio then
@@ -907,9 +921,7 @@ function Lib._xhair()
     for _,l in ipairs(crossLines) do l.Visible=vis; l.Color=col; l.Thickness=thk end
     _crosshairVPCache=vp
 end
-Lib._xhair()
-
-Lib._xhair()
+Lib._xhair()  -- inicialização única
 
 -- Off-Screen Indicator — seta apontando pro alvo fora da tela
 local _osArrow=makeDrawing("Triangle",{Filled=true,Color=Color3.fromRGB(255,80,80),Thickness=1})
@@ -929,7 +941,9 @@ local function _updateOffScreen(camCF,vpX,vpY)
     local tarWorld=Vector3.new(dx,dy,dz)
     local right=camCF.RightVector; local up=camCF.UpVector
     local screenX=tarWorld:Dot(right); local screenY=-tarWorld:Dot(up)
-    local mag=sqrt(screenX*screenX+screenY*screenY); if mag<0.001 then return end
+    local mag=sqrt(screenX*screenX+screenY*screenY); if mag<0.001 then
+        if _lastOSVisible then _osArrow.Visible=false; _osArrowOutline.Visible=false; _lastOSVisible=false end; return  -- FIX: esconder seta se vetores degenerados
+    end
     local nx=screenX/mag; local ny=screenY/mag
     local margin=40; local cx=vpX*0.5; local cy=vpY*0.5
     local halfX=cx-margin; local halfY=cy-margin
@@ -971,12 +985,18 @@ function Lib._keybind(bindName,displayBtn)
         if inp.UserInputType==Enum.UserInputType.Keyboard then
             Config.Keybinds[bindName]={ktype="key",value=inp.KeyCode}; displayBtn.Text=inp.KeyCode.Name
             TweenService:Create(displayBtn,TI_FAST,{BackgroundColor3=COLORS.bg_card}):Play()
-            conn:Disconnect(); conn=nil; notify("Bind "..bindName..": "..inp.KeyCode.Name,"success"); configDirty=true; pcall(saveConfig); return
+            conn:Disconnect(); conn=nil; notify("Bind "..bindName..": "..inp.KeyCode.Name,"success"); configDirty=true; pcall(saveConfig)
+            -- FIX: sincronizar labels de createToggleKeybind que usam este bind
+            local upd=UIComponents["_kbind_update_"..bindName]; if upd and upd.setValue then pcall(upd.setValue) end
+            return
         end
         if MOUSE_BUTTON_NAMES[inp.UserInputType] then
             Config.Keybinds[bindName]={ktype="mouse",value=inp.UserInputType}; local mname=MOUSE_BUTTON_NAMES[inp.UserInputType]
             displayBtn.Text=mname; TweenService:Create(displayBtn,TI_FAST,{BackgroundColor3=COLORS.bg_card}):Play()
-            conn:Disconnect(); conn=nil; notify("Bind "..bindName..": "..mname,"success"); configDirty=true; pcall(saveConfig); return
+            conn:Disconnect(); conn=nil; notify("Bind "..bindName..": "..mname,"success"); configDirty=true; pcall(saveConfig)
+            -- FIX: sincronizar labels de createToggleKeybind que usam este bind
+            local upd=UIComponents["_kbind_update_"..bindName]; if upd and upd.setValue then pcall(upd.setValue) end
+            return
         end
     end)
 end
@@ -993,10 +1013,14 @@ end
 local function createToggleKeybind(parent,label,configKey,bindName,callback,tooltip)
     local bind=Config.Keybinds[bindName]; local bindLabel=bind and ("  [ "..Lib._bindName(bind).." ]") or ""
     local row=createToggle(parent,label..bindLabel,configKey,callback,tooltip)
-    -- FIX: registrar no UIComponents para que o label atualize quando o keybind for remapeado
     local lbl=row:FindFirstChildWhichIsA("TextLabel")
     if lbl then
+        -- FIX: armazenar referência ao lbl para atualização sincronizada com Settings keybind
         UIComponents["_tkb_"..configKey.."_"..bindName]={setValue=function()
+            local b=Config.Keybinds[bindName]; lbl.Text=label..(b and ("  [ "..Lib._bindName(b).." ]") or "")
+        end}
+        -- FIX: também registrar pelo nome do bind para que Settings atualize automaticamente
+        UIComponents["_kbind_update_"..bindName]={setValue=function()
             local b=Config.Keybinds[bindName]; lbl.Text=label..(b and ("  [ "..Lib._bindName(b).." ]") or "")
         end}
     end
@@ -1290,12 +1314,12 @@ local function _rebuildWallFilterBase()
     for i=1,validCount do transparentParts[i]=_wallFilter[i+1] end
     for i=validCount+1,#transparentParts do transparentParts[i]=nil end
     local localChar=LocalPlayer.Character
-    if localChar then n=n+1; _wallFilter[n]=localChar end
     for i=n+1,#_wallFilter do _wallFilter[i]=nil end
-    _wallFilter[1]=localChar or workspace.Terrain; _wallFilterDirty=false
+    _wallFilter[1]=localChar or workspace.Terrain; _wallFilterDirty=false; _wallFilterVersion=_wallFilterVersion+1
 end
 
 local _visCheckParts={false,false,false,false,false}; local _visLastChar=nil
+local _wallFilterVersion=0; local _visFilterVersion=-1
 local function _getOrCreateVisSlot(char) local s=_visCache[char]; if not s then s={vis=false,visPart=false,t=0}; _visCache[char]=s end; return s end
 
 local _visFilterWithChar={}  -- filter temporário incluindo char alvo
@@ -1304,10 +1328,12 @@ function Lib._isVisible(char,forAimbot,camCF_)
     local slot=_getOrCreateVisSlot(char); if (now-slot.t)<ttl then return slot.vis,slot.visPart end
     if _wallFilterDirty then _rebuildWallFilterBase() end
     local useCF=camCF_ or Camera.CFrame; local origin=useCF.Position; local cc=_getCharCache(char)
+    if not cc then slot.vis=false; slot.visPart=nil; slot.t=now; return false,nil end
     local camLook=useCF.LookVector; local camLookX,camLookY,camLookZ=camLook.X,camLook.Y,camLook.Z
     -- FIX: incluir char alvo no filter sem sobrescrever localChar no slot[1]
-    if _visLastChar~=char then
+    if _visLastChar~=char or _visFilterVersion~=_wallFilterVersion then
         _visLastChar=char
+        _visFilterVersion=_wallFilterVersion
         local n=#_wallFilter
         for i=1,n do _visFilterWithChar[i]=_wallFilter[i] end
         _visFilterWithChar[n+1]=char
@@ -1359,18 +1385,29 @@ local function getFinalAimPosition(aimPart,state,camPos)
         local vel=state.velocity; local vx,vy,vz=vel.X,vel.Y,vel.Z; local vMag2=vx*vx+vy*vy+vz*vz
         if vMag2>1 then
             local ping=Config.LagCompensation and _getCachedPing() or 0; local dist=sqrt(dist2)
-            local bulletTime=(Config.BulletSpeed>0) and (dist/Config.BulletSpeed) or 0; local tPred=ping+bulletTime+0.016
+            local bulletTime=(Config.BulletSpeed>0) and (dist/Config.BulletSpeed) or 0
+            local tPred=ping+bulletTime+0.016
+            -- AIM-FIX-1: loop iterativo refinado — cada iteração recalcula tPred com a posição predita anterior
+            -- Isso converge para o tempo de voo correto (ao invés de usar sempre a distância original)
             for _=1,2 do
-                local ox,oy,oz=vx*tPred,vy*tPred,vz*tPred; local maxPred=state.speed*tPred*MAX_PREDICTION_VEL
-                local omag2=ox*ox+oy*oy+oz*oz; if omag2>maxPred*maxPred then local s=maxPred/sqrt(omag2); ox=ox*s; oy=oy*s; oz=oz*s end
+                local ox,oy,oz=vx*tPred,vy*tPred,vz*tPred
+                local maxPred=state.speed*tPred*MAX_PREDICTION_VEL
+                local omag2=ox*ox+oy*oy+oz*oz
+                if omag2>maxPred*maxPred then local s=maxPred/sqrt(omag2); ox=ox*s; oy=oy*s; oz=oz*s end
                 if not state.isAirborne or state.inVehicle then oy=0 end
                 local predX=base.X+ox; local predY=base.Y+oy; local predZ=base.Z+oz
-                local ndx=predX-camPos.X; local ndy=predY-camPos.Y; local ndz=predZ-camPos.Z; local newDist=sqrt(ndx*ndx+ndy*ndy+ndz*ndz)
-                bulletTime=(Config.BulletSpeed>0) and (newDist/Config.BulletSpeed) or 0; tPred=ping+bulletTime+0.016
+                local ndx=predX-camPos.X; local ndy=predY-camPos.Y; local ndz=predZ-camPos.Z
+                local newDist=sqrt(ndx*ndx+ndy*ndy+ndz*ndz)
+                bulletTime=(Config.BulletSpeed>0) and (newDist/Config.BulletSpeed) or 0
+                tPred=ping+bulletTime+0.016
             end
-            local ox,oy,oz=vx*tPred,vy*tPred,vz*tPred; local maxPred=state.speed*tPred*MAX_PREDICTION_VEL
-            local omag2=ox*ox+oy*oy+oz*oz; if omag2>maxPred*maxPred then local s=maxPred/sqrt(omag2); ox=ox*s; oy=oy*s; oz=oz*s end
-            if not state.isAirborne or state.inVehicle then oy=0 end; base=Vector3.new(base.X+ox,base.Y+oy,base.Z+oz)
+            -- Aplicar offset final com tPred convergido
+            local ox,oy,oz=vx*tPred,vy*tPred,vz*tPred
+            local maxPred=state.speed*tPred*MAX_PREDICTION_VEL
+            local omag2=ox*ox+oy*oy+oz*oz
+            if omag2>maxPred*maxPred then local s=maxPred/sqrt(omag2); ox=ox*s; oy=oy*s; oz=oz*s end
+            if not state.isAirborne or state.inVehicle then oy=0 end
+            base=Vector3.new(base.X+ox,base.Y+oy,base.Z+oz)
         end
     end; return base
 end
@@ -1412,7 +1449,7 @@ local function _flickFindTarget(camCF,vpX,vpY)
         if not player or player==false or not player.Parent then continue end
         if Config.Whitelist[player.UserId] then continue end
         local char=player.Character; if not char then continue end
-        local cc=_getCharCache(char); local hum=cc and cc.hum
+        local cc=_getCharCache(char); if not cc then continue end; local hum=cc and cc.hum
         if not hum or hum.Health<=0 then continue end
         if Config.TeamCheck and player.Team==LocalPlayer.Team then continue end
         local root=cc.root; if not root then continue end
@@ -1490,8 +1527,11 @@ _flickTick=function(dt,camCF)
         local retSpeed=clamp(Config.FlickReturnSpeed*0.15,0.12,3.0)*60
         _flickRetProg=min(_flickRetProg+dt*retSpeed,1)
         local t=_flickRetProg*_flickRetProg*(3-2*_flickRetProg)  -- smoothstep
-        local ol=_flickOriginLook; local cur=camCF.LookVector
+        local ol=_flickOriginLook
+        -- AIM-FIX-6: interpolar da look NO INÍCIO do retorno (não da look atual),
+        -- caso o jogador mova a câmera durante o retorno o destino permanece correto
         if ol then
+            local cur=_flickTargetLook or camCF.LookVector  -- usar target salvo como início do retorno
             local lx=cur.X+(ol.X-cur.X)*t; local ly=cur.Y+(ol.Y-cur.Y)*t; local lz=cur.Z+(ol.Z-cur.Z)*t
             local lmag=sqrt(lx*lx+ly*ly+lz*lz)
             if lmag>1e-6 then
@@ -1512,7 +1552,7 @@ local function applyAim(aimPos,dt,camCF)
     local tarX=tx*invTarMag; local tarY=ty*invTarMag; local tarZ=tz*invTarMag
     local lx,ly,lz
     if Config.SpringSmoothing then
-        local damping=Config.SpringDamping*0.01; local omega=_cachedSmoothSpeed*damping; local k1=2*omega; local k2=omega*omega
+        local damping=max(Config.SpringDamping*0.01,0.001); local omega=_cachedSmoothSpeed*damping; local k1=2*omega; local k2=omega*omega  -- FIX: damping nunca zero
         local ex=tarX-curLook.X; local ey=tarY-curLook.Y; local ez=tarZ-curLook.Z
         _springVelX=_springVelX+(k2*ex-k1*_springVelX)*dt; _springVelY=_springVelY+(k2*ey-k1*_springVelY)*dt; _springVelZ=_springVelZ+(k2*ez-k1*_springVelZ)*dt
         lx=curLook.X+_springVelX*dt; ly=curLook.Y+_springVelY*dt; lz=curLook.Z+_springVelZ*dt
@@ -1547,7 +1587,7 @@ local function _tryScorePlayer(player,camCF,camPos_,vpHalfX,vpHalfY,fovR2,fovR,m
     if not player or player==false or not player.Parent then return end
     if Config.Whitelist[player.UserId] then return end
     local char=player.Character; if not char then return end
-    local cc=_getCharCache(char); local hum=cc.hum; if not hum then return end
+    local cc=_getCharCache(char); if not cc then return end; local hum=cc.hum; if not hum then return end
     local health=hum.Health; local maxHealth=hum.MaxHealth; if health<=0 then return end
     if Config.TeamCheck and player.Team==LocalPlayer.Team then return end
     local root=cc.root; if not root then return end
@@ -1565,7 +1605,9 @@ local function _tryScorePlayer(player,camCF,camPos_,vpHalfX,vpHalfY,fovR2,fovR,m
         else if char==bestTarget then _bestTargetLastLoS=nowTick end end
     end
     if inLockMin and char~=bestTarget then return end
-    local fovNorm=fovR>0 and (d2d/fovR) or 0; local distNorm=Config.MaxDistance>0 and (dist3d/Config.MaxDistance) or 0
+    local fovNorm=fovR>0 and (d2d/fovR) or 0
+    local distNorm=Config.MaxDistance>0 and (dist3d/Config.MaxDistance) or 0
+    -- AIM-FIX-3: hpNorm: (1 - hp/maxHp) → 0=cheio, 1=quase morto. Peso HP prioriza alvos mais fracos.
     local hpNorm=maxHealth>0 and (1-health/maxHealth) or 0
     local score=(_cachedWFOV*fovNorm+_cachedWDist*distNorm+_cachedWHP*hpNorm)*_cachedWInvTotal
     if Config.PriorityList[player.UserId] then score=score*0.1 end
@@ -1576,7 +1618,11 @@ end
 local function findBestTarget(camCF,vpX,vpY)
     local vpHalfX=vpX*0.5; local vpHalfY=vpY*0.5; local camPos_=camCF.Position; local nowTick=_frameTick
     local fovForCalc=Config.FOV
-    if bestTarget and bestTargetRoot then local _bx=camPos_.X-bestTargetRoot.Position.X; local _by=camPos_.Y-bestTargetRoot.Position.Y; local _bz=camPos_.Z-bestTargetRoot.Position.Z; fovForCalc=Lib._getEffFov(sqrt(_bx*_bx+_by*_by+_bz*_bz),bestTargetState) end
+    -- AIM-FIX-4: verificar bestTargetRoot.Parent antes de acessar .Position
+    if bestTarget and bestTargetRoot and bestTargetRoot.Parent then
+        local _bx=camPos_.X-bestTargetRoot.Position.X; local _by=camPos_.Y-bestTargetRoot.Position.Y; local _bz=camPos_.Z-bestTargetRoot.Position.Z
+        fovForCalc=Lib._getEffFov(sqrt(_bx*_bx+_by*_by+_bz*_bz),bestTargetState)
+    end
     if fovForCalc~=_lastAimFov or vpY~=_lastAimVpY then _lastAimFov=fovForCalc; _lastAimVpY=vpY; _cachedAimFovR=tan(rad(fovForCalc*0.5))/_tanHalfCamFOV*vpHalfY; _cachedFovR2=_cachedAimFovR*_cachedAimFovR end
     local fovR=_cachedAimFovR; local fovR2=_cachedFovR2
     if vpX~=_lastAspectVpX or vpY~=_lastAspectVpY then _lastAspectVpX=vpX; _lastAspectVpY=vpY; _cachedAspectRatio=vpX/vpY end
@@ -1620,7 +1666,8 @@ Lib.Connections.MainRender=RunService.RenderStepped:Connect(function(dt)
         local showCircle=Config.ShowFOV and (Config.AimbotEnabled or Config.FlickEnabled)
         if showCircle then
             local td=nil
-            if bestTargetRoot then
+            -- ESP-FIX-7: verificar bestTargetRoot.Parent antes de acessar .Position
+            if bestTargetRoot and bestTargetRoot.Parent then
                 local _cp=camCF.Position; local _dx=_cp.X-bestTargetRoot.Position.X; local _dy=_cp.Y-bestTargetRoot.Position.Y; local _dz=_cp.Z-bestTargetRoot.Position.Z
                 td=sqrt(_dx*_dx+_dy*_dy+_dz*_dz)
             end
@@ -1634,6 +1681,7 @@ Lib.Connections.MainRender=RunService.RenderStepped:Connect(function(dt)
 
     if not Config.AimbotEnabled then
         bestTarget=nil; bestAimPart=nil; bestTargetRoot=nil; bestTargetState=nil
+        -- AIM-FIX-2: resetar spring velocity quando aimbot desligado, evita velocidade acumulada stale
         _springVelX=0; _springVelY=0; _springVelZ=0
         if HAS_DRAWING then Lib._setFovColor(_fovColors.idle) end
     else
@@ -1659,9 +1707,29 @@ local _localMouse=LocalPlayer:GetMouse(); local triggerbotFiring=false; local _t
 Lib.Connections.Triggerbot=RunService.Heartbeat:Connect(function()
     if not Config.TriggerbotEnabled then return end; if not HAS_MOUSE1CLICK then return end
     local shouldFire=false; local currentTarget=nil
-    if Config.TriggerIntegrated and Config.AimbotEnabled and bestTarget then local lvis=Lib._isVisible(bestTarget,true); if lvis then shouldFire=true; currentTarget=bestTarget end
+    if Config.TriggerIntegrated and Config.AimbotEnabled and bestTarget then
+        -- AIM-FIX-5: bestTarget é char; _isVisible aceita char diretamente
+        local lvis=Lib._isVisible(bestTarget,true); if lvis then shouldFire=true; currentTarget=bestTarget end
     else
-        local target=_localMouse.Target; if target and target.Parent then local char=target.Parent; local cc=_charCache[char]; if cc and cc.hum then local player=_charToPlayer[char]; if player and player~=LocalPlayer then if not(Config.TeamCheck and player.Team==LocalPlayer.Team) then if not Config.Whitelist[player.UserId] then local vis=Lib._isVisible(char,true); if vis then shouldFire=true; currentTarget=char end end end end end end
+        local target=_localMouse.Target
+        if target and target.Parent then
+            local char=target.Parent
+            local cc=_getCharCache(char)
+            if not cc then
+                local pp=target.Parent.Parent
+                if pp then cc=_getCharCache(pp) end
+            end
+            if cc and cc.hum then
+                local player=_charToPlayer[char]
+                if player and player~=LocalPlayer then
+                    if not(Config.TeamCheck and player.Team==LocalPlayer.Team) then
+                        if not Config.Whitelist[player.UserId] then
+                            local vis=Lib._isVisible(char,true); if vis then shouldFire=true; currentTarget=char end
+                        end
+                    end
+                end
+            end
+        end
     end
     if not shouldFire then return end
     if triggerbotFiring and currentTarget~=_triggerbotLastTarget then triggerbotFiring=false end
@@ -1849,6 +1917,8 @@ Lib.Connections.AutoPeekTick=RunService.Heartbeat:Connect(function(dt)
     if not Config.AutoPeekEnabled or _peekState=="idle" then return end
     local char=LocalPlayer.Character; if not char then _peekReset(); return end
     local hrp=char:FindFirstChild("HumanoidRootPart"); if not hrp then _peekReset(); return end
+    -- FIX: pre-check de variáveis de peek antes de usá-las
+    if not _peekOriginCF or not _peekTargetPos then _peekReset(); return end
     local peekSpeed=Config.AutoPeekSpeed*dt
 
     if _peekState=="peeking" then
@@ -1925,7 +1995,7 @@ end
 
 _onPlayerDied=function(char,player)
     if not player then player=_charToPlayer[char] end
-    if Lib then clearPlayerESP(player,char) end
+    if Lib and isRunning then clearPlayerESP(player,char) end  -- FIX: também checar isRunning para evitar race com Unload
     if bestTarget==char then bestTarget=nil; bestAimPart=nil; _bestTargetLockStart=0 end
     if diedConnections[char] then pcall(function() diedConnections[char]:Disconnect() end); diedConnections[char]=nil end
     if _charToPlayer[char] then _charToPlayer[char]=nil end
@@ -1945,7 +2015,7 @@ local BONES_R15={"Head","UpperTorso","UpperTorso","LowerTorso","UpperTorso","Lef
 local BONES_R6={"Head","Torso","Torso","Left Arm","Torso","Right Arm","Torso","Left Leg","Torso","Right Leg"}
 
 local function _buildBoneCache(char)
-    local isR15=char:FindFirstChild("UpperTorso")~=nil; local map=isR15 and BONES_R15 or BONES_R6; local n=#map/2; local cache={}
+    local isR15=char:FindFirstChild("UpperTorso")~=nil; local map=isR15 and BONES_R15 or BONES_R6; local n=floor(#map/2); local cache={}
     for i=1,n do cache[i*2-1]=char:FindFirstChild(map[i*2-1]); cache[i*2]=char:FindFirstChild(map[i*2]) end
     cache.n=n; _boneCache[char]=cache
     local old=_boneCacheConns[char]; if old then pcall(function() old:Disconnect() end) end
@@ -1977,8 +2047,14 @@ local function _esp_updateCorners(player,char,cc,camCF,vpHalfX,vpHalfY,espColor)
     local topY_w=head and (head.Position.Y+head.Size.Y*0.5+0.15) or rootPosY+3.2; local botY_w=rootPosY-root.Size.Y*0.5
     local rootDepth=max(screenRootZ,0.001); local pps=vpHalfY/(_tanHalfCamFOV*rootDepth)
     local sTopY=screenRootY-(topY_w-rootPosY)*pps; local sBotY=screenRootY-(botY_w-rootPosY)*pps
-    local bh=abs(sBotY-sTopY); local bw
-    if lShoulder and rShoulder then local sLx=getVPPoint(lShoulder); local sRx=getVPPoint(rShoulder); bw=max(abs(sRx-sLx)*1.3,bh*0.45) else bw=bh*0.5 end
+    local bh=abs(sBotY-sTopY)
+    -- ESP-FIX-1: bh=0 quando head e root colidem (personagem morto/pose estranha) → skip rendering
+    if bh<2 then
+        if _activeCorners[player] then releaseCornerLines(_activeCorners[player]); _activeCorners[player]=nil; _cornerPosCache[player]=nil end
+        return false,0,0,0,0
+    end
+    local bw
+    if lShoulder and rShoulder and lShoulder.Parent and rShoulder.Parent then local sLx=getVPPoint(lShoulder); local sRx=getVPPoint(rShoulder); bw=max(abs(sRx-sLx)*1.3,bh*0.45) else bw=bh*0.5 end
     local boxX=screenRootX-bw*0.5; local boxY=sTopY; local boxW=bw; local boxH=bh
     if not _activeCorners[player] then _activeCorners[player]=getCornerLines() end
     local cl=_activeCorners[player]; local cs=min(bw,bh)*0.25; local x1,y1=boxX,boxY; local x2,y2=boxX+bw,boxY+bh
@@ -2002,7 +2078,9 @@ local function _esp_updateHealthBar(player,screenRootX,screenRootY,onScreen,hp,b
     local barX,barY,bh; if boxOK then barX=boxX-HB_W-HB_O; barY=boxY; bh=boxH elseif onScreen then barX=screenRootX-20-HB_W-HB_O; barY=screenRootY-40; bh=40 end
     if barX then
         if not _activeHB[player] then local pn=#_poolHB; if pn>0 then _activeHB[player]=_poolHB[pn]; _poolHB[pn]=nil else _activeHB[player]={bg=makeDrawing("Square",{Filled=true},true),fill=makeDrawing("Square",{Filled=true},true)} end end
-        local hb=_activeHB[player]; local fh=max(1,floor(bh*min(hp,1)))
+        local hb=_activeHB[player]
+        -- ESP-FIX-2: fh clampado a bh para evitar offset negativo com overheal ou arredondamento
+        local fh=clamp(floor(bh*min(hp,1)),1,bh)
         hb.bg.Position=Vector2.new(barX,barY); hb.bg.Size=Vector2.new(HB_W,bh); hb.bg.Visible=true
         hb.fill.Position=Vector2.new(barX,barY+(bh-fh)); hb.fill.Size=Vector2.new(HB_W,fh); hb.fill.Color=Lib._getHP(hp); hb.fill.Visible=true
     else local hb=_activeHB[player]; if hb then _activeHB[player]=nil; hb.bg.Visible=false; hb.fill.Visible=false; _poolHB[#_poolHB+1]=hb end end
@@ -2014,7 +2092,7 @@ local function _esp_updateLabels(player,char,uid,uidMod,espColor,screenRootX,scr
     local lb=_activeLabels[player]
     if (espFrameCount+uidMod)%3==0 then
         local slot_=_stateSlot[uid]
-        local moveIcon=(slot_ and slot_.state.isMoving) and " ►" or " ■"
+        local moveIcon=(slot_ and slot_.state and slot_.state.isMoving) and " ►" or " ■"
         local lockIcon=(char==bestTarget) and " 🎯" or ""
         local weaponStr=""
         if Config.WeaponLabelEnabled then
@@ -2027,7 +2105,8 @@ local function _esp_updateLabels(player,char,uid,uidMod,espColor,screenRootX,scr
             if wn~="" then weaponStr=" ["..wn.."]" end
         end
         lb.name.Text=sfmt("%s%s%s%s",player.DisplayName,moveIcon,lockIcon,weaponStr)
-        lb.dist.Text=sfmt("%dm  HP:%d%%",floor(dist),floor(hp*100))
+        -- ESP-FIX-3: HP clampado a 100 no display (overheal não mostra >100%)
+        lb.dist.Text=sfmt("%dm  HP:%d%%",floor(dist),clamp(floor(hp*100),0,100))
     end
     local lp=_labelPosCache[player]; local labelY=boxOK and (boxY-2) or (screenRootY-50); local nameY=labelY-14; local distY=labelY-2
     if not lp or abs(lp[1]-screenRootX)>0.5 or abs(lp[2]-nameY)>0.5 or lp[3]~=espColor then
@@ -2040,9 +2119,13 @@ end
 
 local function _esp_updateSkeleton(player,char,espColor,camPos2,camLook2)
     if not Config.SkeletonEnabled then if _activeSkel[player] then releaseSkeletonLines(_activeSkel[player]); _activeSkel[player]=nil end; return end
-    local bones=getBoneCacheParts(char); if not bones then return end; local bCount=bones.n or 0
+    local bones=getBoneCacheParts(char); if not bones then return end; local bCount=bones.n or 0; if bCount==0 then return end
     local existingSkel=_activeSkel[player]; if existingSkel and #existingSkel~=bCount then releaseSkeletonLines(existingSkel); _activeSkel[player]=nil end
-    if not _activeSkel[player] then _activeSkel[player]=getSkeletonLines(bCount) end
+    if not _activeSkel[player] then
+        _activeSkel[player]=getSkeletonLines(bCount)
+        -- ESP-FIX-9: forçar colorChanged na primeira alocação para garantir cor inicial correta
+        _skelColorCache[player]=nil
+    end
     local lines=_activeSkel[player]; local clx=camLook2.X; local cly=camLook2.Y; local clz=camLook2.Z
     local cx2=camPos2.X; local cy2=camPos2.Y; local cz2=camPos2.Z; local colorChanged=_skelColorCache[player]~=espColor
     if colorChanged then _skelColorCache[player]=espColor end
@@ -2066,12 +2149,14 @@ local function _esp_updateChams(player,char,hp)
     else releaseHighlight(char); _chamHPCache[player]=nil end
 end
 
-local _weaponCache={}  -- [player] = toolName cached, atualizado pelo ChildAdded do char
+-- _weaponCache já declarado no escopo global acima
 
 local function _esp_updateTracer(player,screenRootX,screenRootY,onScreen,espColor,vpY,vpHalfX,vpHalfY)
     if not Config.TracerEnabled or not onScreen then local tr=_activeTracers[player]; if tr then tr.Visible=false; _poolTracer[#_poolTracer+1]=tr; _activeTracers[player]=nil end; _tracerToX[player]=nil; _tracerToY[player]=nil; return end
     if not _activeTracers[player] then _activeTracers[player]=poolGet(_poolTracer,"Line") end
     local tr=_activeTracers[player]; local originKey=Config.TracerOrigin
+    -- ESP-FIX-4: fallback para "Bottom" se TracerOrigin for valor inválido
+    if originKey~="Bottom" and originKey~="Center" and originKey~="Crosshair" then originKey="Bottom" end
     local expectedY=originKey=="Bottom" and vpY or vpHalfY
     local fromV2=_tracerFromCache[originKey]; if not fromV2 or fromV2.X~=vpHalfX or fromV2.Y~=expectedY then fromV2=Vector2.new(vpHalfX,expectedY); _tracerFromCache[originKey]=fromV2 end
     tr.From=fromV2
@@ -2085,7 +2170,9 @@ local function _esp_updateHeadDot(player,char,cc,espColor)
     local hx,hy,hz,onSc=getVPPoint(head)
     if not onSc or hz<=0 then local hd=_activeHDots[player]; if hd then hd.Visible=false; _poolHDot[#_poolHDot+1]=hd; _activeHDots[player]=nil end; return end
     if not _activeHDots[player] then local n=#_poolHDot; if n>0 then _activeHDots[player]=_poolHDot[n]; _poolHDot[n]=nil else _activeHDots[player]=makeDrawing("Circle",{Filled=true,NumSides=16,Thickness=0},true) end end
-    local hd=_activeHDots[player]; local r=clamp(floor(6/max(hz,1)*50),2,8)
+    local hd=_activeHDots[player]
+    -- ESP-FIX-5: raio escalado por profundidade Z; clamp mais conservador (1,6) para não poluir a tela quando próximo
+    local r=clamp(floor(4/max(hz,0.5)*30),1,6)
     hd.Position=Vector2.new(hx,hy); hd.Radius=r; hd.Color=espColor; hd.Visible=true
 end
 
@@ -2096,7 +2183,19 @@ _runESP=function(camCF,vp,vpX,vpY)
     _hlCheckCounter=_hlCheckCounter+1
     if _hlCheckCounter>=_HL_CHECK_INTERVAL then _hlCheckCounter=0; for char in next,_activeHL do if not char.Parent then releaseHighlight(char) end end end
     if not _espAnyActive then
-        if _espWasActive then local players,n=getPlayerSnapshot(); for i=1,n do local p=players[i]; if p then clearPlayerESP(p,p.Character) end end; for char in pairs(_activeHL) do releaseHighlight(char) end; _espWasActive=false end; return
+        if _espWasActive then
+            local players,n=getPlayerSnapshot()
+            for i=1,n do
+                local p=players[i]
+                if p then
+                    -- ESP-FIX-6: capturar char no momento do clear para evitar race com CharacterAdded
+                    local pchar=p.Character; clearPlayerESP(p,pchar)
+                end
+            end
+            for char in pairs(_activeHL) do releaseHighlight(char) end
+            _espWasActive=false
+        end
+        return
     end
     _espWasActive=true
     local vpHalfX=vpX*0.5; local vpHalfY=vpY*0.5; local camPos2=camCF.Position; local camLook2=camCF.LookVector
@@ -2112,7 +2211,11 @@ _runESP=function(camCF,vp,vpX,vpY)
         local root=cc.root; if not root then continue end
         do
             local rp=root.Position; local rx=rp.X-camPos2.X; local ry=rp.Y-camPos2.Y; local rz=rp.Z-camPos2.Z; local dist2=rx*rx+ry*ry+rz*rz
-            if dist2>maxDist2 then if _activeCorners[player] then releaseCornerLines(_activeCorners[player]); _activeCorners[player]=nil; _cornerPosCache[player]=nil end; continue end
+            if dist2>maxDist2 then
+                -- ESP-FIX-8: liberar TODOS os elementos ESP (não só corners) quando fora do range
+                clearPlayerESP(player,char)
+                continue
+            end
             local uid=player.UserId; local slot_=_stateSlot[uid]; local uidMod=slot_ and slot_.uidMod or (uid%3)
             if dist2>lodDist2 and (espFrameCount+uidMod)%2==1 then continue end
             local dist=sqrt(dist2); local hp=max(hum.Health,0)/max(hum.MaxHealth,1)
@@ -2458,6 +2561,11 @@ Unload=function()
     for _,conns in pairs(_inVehicleEventConns) do pcall(function() conns[1]:Disconnect() end); pcall(function() conns[2]:Disconnect() end) end; tbl_clear(_inVehicleEventConns)
     tbl_clear(notifQueue); notifHead=1; notifTail=0; tbl_clear(_playerListCache); tbl_clear(_playerSet); tbl_clear(_transparentSet)
     tbl_clear(_tracerToX); tbl_clear(_tracerToY)
+    -- FIX-03: limpar caches adicionais que antes ficavam na memória após unload
+    tbl_clear(_labelPosCache); tbl_clear(_skelColorCache)
+    tbl_clear(_playerVehicleChar); tbl_clear(_weaponCache)
+    -- FIX: limpar _chamHPCache que não estava sendo limpo no Unload
+    tbl_clear(_chamHPCache); tbl_clear(_cornerPosCache)
     -- FIX: desconectar _recoilConn explicitamente — pode estar ativo se unload ocorrer durante disparo
     if _recoilConn then pcall(function() _recoilConn:Disconnect() end); _recoilConn=nil end
     print("PHANTOM HUB: Unload completo. (v3.2 — 88 fixes/melhorias aplicadas)")
@@ -2478,7 +2586,7 @@ task.spawn(function()
         task.wait(0.5); if not Config.DebugMode or not Lib then continue end
         local espPool=#(Lib.ESPPool or {}); local corrPool=#(Lib.CornerPool or {}); local trkPool=#(Lib.TracerPool or {})
         local vp=Camera.ViewportSize; local aspectName=_detectAspectName and _detectAspectName(vp.X,vp.Y) or "N/A"
-        local targetName=bestTarget and (_charToPlayer[bestTarget] or {DisplayName="?"}).DisplayName or "nenhum"
+        local targetName=bestTarget and ((_charToPlayer[bestTarget] and _charToPlayer[bestTarget].DisplayName) or "?") or "nenhum"
         log(sfmt("Pools ESP:%d Corner:%d Tracer:%d | HL:%d/%d | Alvo:%s | Res:%s | Players:%d | FC:%d | VPPool:%d",espPool,corrPool,trkPool,highlightCount,MAX_HIGHLIGHTS,targetName,aspectName,#_playerListCache,_frameCount%10000,#_vpEntryPool),LogLevel.INFO)
         if espPool<5 then log("Pool ESP baixo: "..espPool,LogLevel.WARN) end
         if corrPool<8 then log("Pool Corner baixo: "..corrPool,LogLevel.WARN) end
@@ -2489,7 +2597,8 @@ end)
 -- ================================================================
 -- 12. INICIALIZAÇÃO FINAL
 -- ================================================================
-task.spawn(function() while isRunning do task.wait(60); if not isRunning then break end; if configDirty and HAS_FILESYSTEM then pcall(saveConfigSilent) end end end)
+-- FIX-04: auto-save a cada 30s (não 60s) — reduz perda de dados em crash
+task.spawn(function() while isRunning do task.wait(30); if not isRunning then break end; if configDirty and HAS_FILESYSTEM then pcall(saveConfigSilent) end end end)
 
 Lib._loadConfig()
 if Config.ActiveProfile and Config.Profiles[Config.ActiveProfile] then Lib._loadProfile(Config.ActiveProfile) end
